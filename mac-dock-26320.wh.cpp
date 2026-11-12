@@ -4,7 +4,7 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock6
+// @version         3.1.0-dock7
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
@@ -2306,6 +2306,9 @@ bool g_turnedAutoHideOn;
 // after the mouse reaches the edge.
 constexpr UINT_PTR kHideTimerId = 2;
 constexpr UINT_PTR kUnhideTimerId = 3;
+// A dock kept shown with its arrow went down anyway: it's shown again (see
+// TrayUI_SlideWindow_Hook and SyncPinnedBars).
+constexpr UINT_PTR kPinnedShowTimerId = 0x4D50;
 
 BOOL CALLBACK FindTaskbarProc(HWND hWnd, LPARAM lParam) {
     DWORD dwProcessId;
@@ -8801,6 +8804,14 @@ void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
         TrayUI_SlideWindow_Original(pThis, hWnd, rect, monitor, show, animate);
         return;
     }
+    // A dock kept shown with its arrow doesn't go, also on a hide that
+    // didn't ask CTaskListWnd_PermitAutoHide_Hook (like a focus change): it
+    // stays where it is, and the taskbar is told it's shown again.
+    if (!show && !g_unloading && IsDock() && g_settings.dockPinButton &&
+        !DockHidesOn(hWnd)) {
+        PostMessage(hWnd, WM_TIMER, kPinnedShowTimerId, 0);
+        return;
+    }
     // (Usually stopped earlier, see CTaskBand_UnhideTray_Hook.)
     if (show && KeepsDownForAttention(hWnd)) {
         LogKeptDown();
@@ -8845,7 +8856,8 @@ void WINAPI TrayUI_SlideWindow_Hook(void* pThis,
         // A show at once with the user not reaching for the dock waits a
         // moment, cut to nothing (see kQuietShowDelayMs).
         if (show && !animate && !g_unloading && IsDock() &&
-            FindGrownTaskbar(hWnd) && !UserIsReachingForTaskbar(hWnd)) {
+            FindGrownTaskbar(hWnd) && !UserIsReachingForTaskbar(hWnd) &&
+            DockHidesOn(hWnd)) {
             g_quietShownWnd = hWnd;
             SetTimer(hWnd, kQuietShowTimerId, kQuietShowDelayMs, nullptr);
         }
@@ -8993,6 +9005,12 @@ void SyncPinnedBars(bool all) {
             }
             const int height =
                 (int)std::ceil(dips * GetDpiForWindow(taskbar) / 96.0);
+            // Gone down anyway (most of it past the edge): back up.
+            RECT window{};
+            if (GetWindowRect(taskbar, &window) &&
+                info.rcMonitor.bottom - window.top < height / 2) {
+                PostMessage(taskbar, WM_TIMER, kPinnedShowTimerId, 0);
+            }
             wanted.push_back(
                 {monitor,
                  {info.rcMonitor.left, info.rcMonitor.bottom - height,
@@ -9879,6 +9897,13 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
     }
     // Shown at once by Windows and still up a moment later: the dock shows
     // now (see kQuietShowDelayMs).
+    if (uMsg == WM_TIMER && wParam == kPinnedShowTimerId) {
+        if (!g_unloading && IsDock() && g_settings.dockPinButton &&
+            !DockHidesOn(hWnd)) {
+            UnhideTaskbar(hWnd);
+        }
+        return 0;
+    }
     if (uMsg == WM_TIMER && wParam == kQuietShowTimerId) {
         KillTimer(hWnd, kQuietShowTimerId);
         if (hWnd == g_quietShownWnd) {
