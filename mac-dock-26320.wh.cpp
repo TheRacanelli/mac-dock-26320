@@ -10,7 +10,7 @@
 // @homepage        https://island.caliberda.com.br
 // @donateUrl       https://github.com/sponsors/cesarkali
 // @include         explorer.exe
-// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lshell32 -ldwmapi -lcomctl32 -lgdi32 -lmsimg32 -ld2d1 -ldwrite -lwlanapi -luuid -lversion -lbthprops -ldxva2 -lshlwapi -lwinhttp -lwinmm -liphlpapi -lshcore -lcomdlg32 -limm32 -lsetupapi -lcfgmgr32 -luserenv
+// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lshell32 -ldwmapi -lcomctl32 -lgdi32 -lmsimg32 -ld2d1 -ldwrite -lwlanapi -luuid -lversion -lbthprops -ldxva2 -lshlwapi -lwinhttp -lwinmm -liphlpapi -lshcore -lcomdlg32 -limm32 -lsetupapi -lcfgmgr32 -luserenv -lws2_32 -lbcrypt
 // @license         GPL-3.0
 // ==/WindhawkMod==
 
@@ -476,6 +476,11 @@ O código que alcança o XAML da barra é baseado no mod
     $name:pt-BR: Pasta de downloads na dock
     $description: An icon at the dock's right end that opens a panel with the latest files in Downloads, like macOS's stack. Files still downloading in Chrome, Edge, Zen or Firefox show as they grow, the icon turns blue, hops and shows how much came down meanwhile, and it bounces when one finishes
     $description:pt-BR: Um ícone na ponta direita da dock que abre um painel com os arquivos mais recentes da pasta Downloads, como a pilha do macOS. Arquivos ainda baixando no Chrome, Edge, Zen ou Firefox aparecem crescendo, o ícone fica azul, pula e mostra quanto já baixou enquanto isso, e pula de novo quando um termina
+  - browserBridge: true
+    $name: Browser bridge (pause/cancel downloads)
+    $name:pt-BR: Ponte com navegadores (pausar/cancelar downloads)
+    $description: With the "Mac Dock Downloads" extension in Chrome or Zen, the Downloads panel shows their downloads with their progress and can pause, resume and cancel them. The dock listens only on this computer (127.0.0.1:47821) and only to browser extensions
+    $description:pt-BR: Com a extensão "Mac Dock Downloads" no Chrome ou no Zen, o painel de Downloads mostra os downloads deles com a porcentagem e consegue pausar, continuar e cancelar. A dock só escuta neste computador (127.0.0.1:47821) e só extensões de navegador
   - backgroundOpacity: 50
     $name: Background color (%)
     $name:pt-BR: Cor do fundo (%)
@@ -806,6 +811,7 @@ O código que alcança o XAML da barra é baseado no mod
 #include <propsys.h>
 #include <wbemidl.h>
 #include <wincodec.h>
+#include <bcrypt.h>
 #include <winhttp.h>
 #include <winioctl.h>
 #include <wlanapi.h>
@@ -845,6 +851,7 @@ O código que alcança o XAML da barra é baseado no mod
 
 #include <winrt/Windows.Devices.Geolocation.h>
 #include <winrt/Windows.Devices.Radios.h>
+#include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Effects.h>
@@ -952,6 +959,8 @@ struct {
     bool dockPinButton;
     // The Downloads stack (dock.downloads).
     bool dockDownloads;
+    // Its bridge to the browsers' extension (dock.browserBridge).
+    bool dockBrowserBridge;
     double backgroundOpacity;
     int showDuration;
     int hideDuration;
@@ -10191,6 +10200,598 @@ void ShowDownloadsPanel(int x, int y) {
     InvalidateRect(g_downloadsWnd, nullptr, FALSE);
 }
 
+// The browser bridge (dock.browserBridge): the "Mac Dock Downloads"
+// extension in Chrome or Zen connects here, on 127.0.0.1:47821, over a
+// WebSocket. It sends what's downloading; the dock sends pause, resume and
+// cancel. Only browser extensions' origins are let in. A thread of its own
+// waits on its sockets (no polling).
+
+// BRIDGE-CORE-BEGIN
+// The WebSocket pieces (RFC 6455), kept apart from the rest of the mod so
+// tools/test-bridge-core.ps1 tests them on their own.
+std::string Base64Encode(const unsigned char* data, size_t size) {
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    for (size_t i = 0; i < size; i += 3) {
+        const unsigned value = (data[i] << 16) |
+                               (i + 1 < size ? data[i + 1] << 8 : 0) |
+                               (i + 2 < size ? data[i + 2] : 0);
+        out.push_back(kAlphabet[(value >> 18) & 63]);
+        out.push_back(kAlphabet[(value >> 12) & 63]);
+        out.push_back(i + 1 < size ? kAlphabet[(value >> 6) & 63] : '=');
+        out.push_back(i + 2 < size ? kAlphabet[value & 63] : '=');
+    }
+    return out;
+}
+
+// The handshake's answer to the client's Sec-WebSocket-Key.
+std::string WsAcceptKey(const std::string& key) {
+    const std::string input = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    unsigned char hash[20] = {};
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA1_ALGORITHM, nullptr,
+                                    0) != 0) {
+        return "";
+    }
+    BCRYPT_HASH_HANDLE hasher = nullptr;
+    bool ok = BCryptCreateHash(algorithm, &hasher, nullptr, 0, nullptr, 0,
+                               0) == 0;
+    ok = ok && BCryptHashData(hasher, (PUCHAR)input.data(),
+                              (ULONG)input.size(), 0) == 0;
+    ok = ok && BCryptFinishHash(hasher, hash, sizeof(hash), 0) == 0;
+    if (hasher) {
+        BCryptDestroyHash(hasher);
+    }
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    return ok ? Base64Encode(hash, sizeof(hash)) : "";
+}
+
+// A header's value in an HTTP request (its name in any case), trimmed.
+std::string HttpHeaderValue(const std::string& request, const char* name) {
+    const size_t nameLength = strlen(name);
+    size_t line = request.find("\r\n");
+    while (line != std::string::npos) {
+        line += 2;
+        const size_t end = request.find("\r\n", line);
+        if (end == std::string::npos || end == line) {
+            break;
+        }
+        const size_t colon = request.find(':', line);
+        if (colon != std::string::npos && colon < end &&
+            colon - line == nameLength &&
+            _strnicmp(request.c_str() + line, name, nameLength) == 0) {
+            size_t first = colon + 1;
+            size_t last = end;
+            while (first < last &&
+                   (request[first] == ' ' || request[first] == '\t')) {
+                first++;
+            }
+            while (last > first &&
+                   (request[last - 1] == ' ' || request[last - 1] == '\t')) {
+                last--;
+            }
+            return request.substr(first, last - first);
+        }
+        line = end;
+    }
+    return "";
+}
+
+// Only browser extensions may connect (a web page's origin is never one).
+bool BridgeOriginAllowed(const std::string& origin) {
+    for (const char* prefix : {"chrome-extension://", "moz-extension://"}) {
+        const size_t length = strlen(prefix);
+        if (origin.size() > length && origin.compare(0, length, prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class WsResult { NeedMore, Message, Error };
+
+struct WsMessage {
+    int opcode = 0;
+    std::string payload;
+};
+
+// (A browser's whole download list fits well within this.)
+constexpr size_t kWsMaxMessage = 1 << 20;
+
+// Reads a client's frames as they arrive: whole messages out (fragments put
+// together, control frames as they come).
+struct WsReader {
+    std::string buffer;
+    std::string fragments;
+    int fragmentOpcode = 0;
+
+    void Feed(const std::string& data) { buffer += data; }
+
+    WsResult Next(WsMessage* out) {
+        for (;;) {
+            if (buffer.size() < 2) {
+                return WsResult::NeedMore;
+            }
+            const unsigned char first = (unsigned char)buffer[0];
+            const unsigned char second = (unsigned char)buffer[1];
+            const bool fin = first & 0x80;
+            const int opcode = first & 0x0F;
+            // (No extensions agreed on; clients always mask.)
+            if ((first & 0x70) || !(second & 0x80)) {
+                return WsResult::Error;
+            }
+            unsigned long long length = second & 0x7F;
+            size_t header = 2;
+            if (length == 126) {
+                if (buffer.size() < 4) {
+                    return WsResult::NeedMore;
+                }
+                length = ((unsigned char)buffer[2] << 8) |
+                         (unsigned char)buffer[3];
+                header = 4;
+            } else if (length == 127) {
+                if (buffer.size() < 10) {
+                    return WsResult::NeedMore;
+                }
+                length = 0;
+                for (int i = 2; i < 10; i++) {
+                    length = (length << 8) | (unsigned char)buffer[i];
+                }
+                header = 10;
+            }
+            if (length > kWsMaxMessage ||
+                (opcode >= 8 && (!fin || length > 125))) {
+                return WsResult::Error;
+            }
+            if (buffer.size() < header + 4 + length) {
+                return WsResult::NeedMore;
+            }
+            const unsigned char* mask =
+                (const unsigned char*)buffer.data() + header;
+            std::string payload((size_t)length, '\0');
+            for (size_t i = 0; i < (size_t)length; i++) {
+                payload[i] = (char)(buffer[header + 4 + i] ^ mask[i % 4]);
+            }
+            buffer.erase(0, header + 4 + (size_t)length);
+            if (opcode >= 8) {
+                out->opcode = opcode;
+                out->payload = std::move(payload);
+                return WsResult::Message;
+            }
+            if (opcode == 0) {
+                if (!fragmentOpcode) {
+                    return WsResult::Error;
+                }
+                fragments += payload;
+            } else if (opcode == 1 || opcode == 2) {
+                if (fragmentOpcode) {
+                    return WsResult::Error;
+                }
+                fragmentOpcode = opcode;
+                fragments = std::move(payload);
+            } else {
+                return WsResult::Error;
+            }
+            if (fragments.size() > kWsMaxMessage) {
+                return WsResult::Error;
+            }
+            if (fin) {
+                out->opcode = fragmentOpcode;
+                out->payload = std::move(fragments);
+                fragments.clear();
+                fragmentOpcode = 0;
+                return WsResult::Message;
+            }
+        }
+    }
+};
+
+// A frame from the dock (servers don't mask).
+std::string WsEncode(int opcode, const std::string& payload) {
+    std::string out;
+    out.push_back((char)(0x80 | opcode));
+    const size_t size = payload.size();
+    if (size < 126) {
+        out.push_back((char)size);
+    } else if (size < 65536) {
+        out.push_back((char)126);
+        out.push_back((char)(size >> 8));
+        out.push_back((char)(size & 0xFF));
+    } else {
+        out.push_back((char)127);
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            out.push_back((char)(((unsigned long long)size >> shift) & 0xFF));
+        }
+    }
+    return out + payload;
+}
+// BRIDGE-CORE-END
+
+constexpr USHORT kBridgePort = 47821;
+// Something a browser said changed the list (for the panel's thread).
+constexpr UINT kBridgeChanged = WM_APP + 11;
+constexpr int kBridgeMaxClients = 4;
+
+struct BridgeItem {
+    int client = 0;
+    long long id = 0;
+    std::wstring path;
+    std::wstring name;
+    ULONGLONG bytes = 0;
+    ULONGLONG total = 0;
+    bool paused = false;
+    bool canResume = false;
+    bool interrupted = false;
+};
+
+struct BridgeClient {
+    SOCKET socket = INVALID_SOCKET;
+    WSAEVENT event = WSA_INVALID_EVENT;
+    int key = 0;
+    bool open = false;
+    bool closing = false;
+    std::string request;
+    WsReader reader;
+    std::string out;
+};
+
+// Guards the three below (shared with the panel's and the dock's threads).
+SRWLOCK g_bridgeLock = SRWLOCK_INIT;
+[[clang::no_destroy]] std::vector<BridgeItem> g_bridgeItems;
+[[clang::no_destroy]] std::vector<std::pair<int, std::wstring>>
+    g_bridgeBrowsers;
+[[clang::no_destroy]] std::vector<std::pair<int, std::string>> g_bridgeOutbox;
+HANDLE g_bridgeThread;
+// Set to send what's in the outbox, or to stop.
+HANDLE g_bridgeWake;
+std::atomic<bool> g_bridgeStop{false};
+
+std::vector<BridgeItem> BridgeSnapshot() {
+    AcquireSRWLockShared(&g_bridgeLock);
+    std::vector<BridgeItem> items = g_bridgeItems;
+    ReleaseSRWLockShared(&g_bridgeLock);
+    return items;
+}
+
+bool BridgeConnected(PCWSTR browser) {
+    bool connected = false;
+    AcquireSRWLockShared(&g_bridgeLock);
+    for (const auto& [key, name] : g_bridgeBrowsers) {
+        if (name == browser) {
+            connected = true;
+        }
+    }
+    ReleaseSRWLockShared(&g_bridgeLock);
+    return connected;
+}
+
+// Asks the browser of `client` to pause, resume or cancel download `id`.
+void BridgeSend(int client, PCWSTR type, long long id) {
+    char text[96];
+    sprintf_s(text, "{\"type\":\"%ls\",\"id\":%lld}", type, id);
+    AcquireSRWLockExclusive(&g_bridgeLock);
+    g_bridgeOutbox.push_back({client, text});
+    ReleaseSRWLockExclusive(&g_bridgeLock);
+    if (g_bridgeWake) {
+        SetEvent(g_bridgeWake);
+    }
+}
+
+void BridgeNotify() {
+    PokeDockRendering();
+    if (g_downloadsThreadId) {
+        PostThreadMessage(g_downloadsThreadId, kBridgeChanged, 0, 0);
+    }
+}
+
+void BridgeForget(int key) {
+    AcquireSRWLockExclusive(&g_bridgeLock);
+    std::erase_if(g_bridgeItems,
+                  [key](const BridgeItem& item) { return item.client == key; });
+    std::erase_if(g_bridgeBrowsers,
+                  [key](const auto& entry) { return entry.first == key; });
+    ReleaseSRWLockExclusive(&g_bridgeLock);
+    BridgeNotify();
+}
+
+void BridgeHandleMessage(BridgeClient& client, const std::string& text) {
+    using namespace winrt::Windows::Data::Json;
+    JsonObject message{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(text), message)) {
+        return;
+    }
+    const std::wstring type(message.GetNamedString(L"type", L""));
+    if (type == L"hello") {
+        const std::wstring browser(message.GetNamedString(L"browser", L""));
+        AcquireSRWLockExclusive(&g_bridgeLock);
+        std::erase_if(g_bridgeBrowsers, [&](const auto& entry) {
+            return entry.first == client.key;
+        });
+        g_bridgeBrowsers.push_back({client.key, browser});
+        ReleaseSRWLockExclusive(&g_bridgeLock);
+        IslandLog(L"Browser bridge: %s connected", browser.c_str());
+        BridgeNotify();
+    } else if (type == L"downloads") {
+        std::vector<BridgeItem> items;
+        const JsonArray list = message.GetNamedArray(L"items", JsonArray());
+        for (const auto& value : list) {
+            if (value.ValueType() != JsonValueType::Object) {
+                continue;
+            }
+            const JsonObject entry = value.GetObject();
+            BridgeItem item;
+            item.client = client.key;
+            item.id = (long long)entry.GetNamedNumber(L"id", 0);
+            item.path = entry.GetNamedString(L"path", L"");
+            item.name = entry.GetNamedString(L"name", L"");
+            item.bytes = (ULONGLONG)std::max(0.0, entry.GetNamedNumber(L"bytes", 0));
+            item.total = (ULONGLONG)std::max(0.0, entry.GetNamedNumber(L"total", 0));
+            item.paused = entry.GetNamedBoolean(L"paused", false);
+            item.canResume = entry.GetNamedBoolean(L"canResume", false);
+            item.interrupted =
+                entry.GetNamedString(L"state", L"") == L"interrupted";
+            if (!item.name.empty()) {
+                items.push_back(std::move(item));
+            }
+        }
+        AcquireSRWLockExclusive(&g_bridgeLock);
+        std::erase_if(g_bridgeItems, [&](const BridgeItem& item) {
+            return item.client == client.key;
+        });
+        g_bridgeItems.insert(g_bridgeItems.end(), items.begin(), items.end());
+        ReleaseSRWLockExclusive(&g_bridgeLock);
+        BridgeNotify();
+    }
+}
+
+// Sends what's waiting for `client`; false if its connection broke.
+bool BridgeFlush(BridgeClient& client) {
+    while (!client.out.empty()) {
+        const int sent = send(client.socket, client.out.data(),
+                              (int)std::min<size_t>(client.out.size(), 65536),
+                              0);
+        if (sent == SOCKET_ERROR) {
+            return WSAGetLastError() == WSAEWOULDBLOCK;
+        }
+        client.out.erase(0, sent);
+    }
+    return true;
+}
+
+// Reads what `client` sent; false once it should be dropped.
+bool BridgeRead(BridgeClient& client) {
+    char chunk[8192];
+    for (;;) {
+        const int got = recv(client.socket, chunk, sizeof(chunk), 0);
+        if (got == 0) {
+            return false;
+        }
+        if (got == SOCKET_ERROR) {
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                break;
+            }
+            return false;
+        }
+        if (!client.open) {
+            client.request.append(chunk, got);
+            const size_t end = client.request.find("\r\n\r\n");
+            if (end == std::string::npos) {
+                if (client.request.size() > 8192) {
+                    return false;
+                }
+                continue;
+            }
+            const std::string key =
+                HttpHeaderValue(client.request, "Sec-WebSocket-Key");
+            const std::string origin = HttpHeaderValue(client.request, "Origin");
+            if (key.empty() || !BridgeOriginAllowed(origin)) {
+                client.out =
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
+                    "Connection: close\r\n\r\n";
+                BridgeFlush(client);
+                return false;
+            }
+            client.out +=
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
+                WsAcceptKey(key) + "\r\n\r\n";
+            client.open = true;
+            client.reader.Feed(client.request.substr(end + 4));
+            client.request.clear();
+        } else {
+            client.reader.Feed(std::string(chunk, got));
+        }
+    }
+    if (!client.open) {
+        return true;
+    }
+    WsMessage message;
+    for (;;) {
+        const WsResult result = client.reader.Next(&message);
+        if (result == WsResult::NeedMore) {
+            break;
+        }
+        if (result == WsResult::Error) {
+            return false;
+        }
+        if (message.opcode == 1) {
+            BridgeHandleMessage(client, message.payload);
+        } else if (message.opcode == 9) {
+            client.out += WsEncode(10, message.payload);
+        } else if (message.opcode == 8) {
+            client.out += WsEncode(8, "");
+            client.closing = true;
+        }
+    }
+    return true;
+}
+
+void BridgeDrop(std::vector<BridgeClient>& clients, size_t index) {
+    BridgeClient& client = clients[index];
+    const bool known = client.open;
+    closesocket(client.socket);
+    WSACloseEvent(client.event);
+    const int key = client.key;
+    clients.erase(clients.begin() + index);
+    if (known) {
+        BridgeForget(key);
+    }
+}
+
+DWORD WINAPI BridgeThreadProc(LPVOID) {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        winrt::uninit_apartment();
+        return 0;
+    }
+    SOCKET listener = INVALID_SOCKET;
+    WSAEVENT listenEvent = WSACreateEvent();
+    std::vector<BridgeClient> clients;
+    int nextKey = 1;
+    while (!g_bridgeStop) {
+        if (listener == INVALID_SOCKET) {
+            listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            BOOL exclusive = TRUE;
+            setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       (const char*)&exclusive, sizeof(exclusive));
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(kBridgePort);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (listener == INVALID_SOCKET ||
+                bind(listener, (sockaddr*)&address, sizeof(address)) != 0 ||
+                listen(listener, kBridgeMaxClients) != 0 ||
+                WSAEventSelect(listener, listenEvent, FD_ACCEPT) != 0) {
+                // (The port taken, by an Explorer still closing: again in a
+                // while.)
+                IslandLog(L"Browser bridge: can't listen (%d)",
+                          WSAGetLastError());
+                if (listener != INVALID_SOCKET) {
+                    closesocket(listener);
+                    listener = INVALID_SOCKET;
+                }
+                WaitForSingleObject(g_bridgeWake, 10000);
+                continue;
+            }
+        }
+        HANDLE handles[2 + kBridgeMaxClients];
+        DWORD count = 0;
+        handles[count++] = g_bridgeWake;
+        handles[count++] = listenEvent;
+        for (const auto& client : clients) {
+            handles[count++] = client.event;
+        }
+        WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+        if (g_bridgeStop) {
+            break;
+        }
+
+        WSANETWORKEVENTS events{};
+        if (WSAEnumNetworkEvents(listener, listenEvent, &events) == 0 &&
+            (events.lNetworkEvents & FD_ACCEPT)) {
+            for (;;) {
+                SOCKET accepted = accept(listener, nullptr, nullptr);
+                if (accepted == INVALID_SOCKET) {
+                    break;
+                }
+                if ((int)clients.size() >= kBridgeMaxClients) {
+                    closesocket(accepted);
+                    continue;
+                }
+                BridgeClient client;
+                client.socket = accepted;
+                client.event = WSACreateEvent();
+                client.key = nextKey++;
+                WSAEventSelect(accepted, client.event,
+                               FD_READ | FD_WRITE | FD_CLOSE);
+                clients.push_back(std::move(client));
+            }
+        }
+
+        // What the dock asked to send.
+        std::vector<std::pair<int, std::string>> outbox;
+        AcquireSRWLockExclusive(&g_bridgeLock);
+        outbox.swap(g_bridgeOutbox);
+        ReleaseSRWLockExclusive(&g_bridgeLock);
+        for (const auto& [key, text] : outbox) {
+            for (auto& client : clients) {
+                if (client.key == key && client.open) {
+                    client.out += WsEncode(1, text);
+                }
+            }
+        }
+
+        for (size_t i = clients.size(); i-- > 0;) {
+            BridgeClient& client = clients[i];
+            WSANETWORKEVENTS clientEvents{};
+            WSAEnumNetworkEvents(client.socket, client.event, &clientEvents);
+            bool keep = true;
+            if (clientEvents.lNetworkEvents & (FD_READ | FD_CLOSE)) {
+                keep = BridgeRead(client);
+            }
+            if (keep) {
+                keep = BridgeFlush(client);
+            }
+            if (keep && (clientEvents.lNetworkEvents & FD_CLOSE)) {
+                keep = false;
+            }
+            if (keep && client.closing && client.out.empty()) {
+                keep = false;
+            }
+            if (!keep) {
+                BridgeDrop(clients, i);
+            }
+        }
+    }
+    while (!clients.empty()) {
+        BridgeDrop(clients, clients.size() - 1);
+    }
+    if (listener != INVALID_SOCKET) {
+        closesocket(listener);
+    }
+    WSACloseEvent(listenEvent);
+    WSACleanup();
+    winrt::uninit_apartment();
+    return 0;
+}
+
+void StartBridge() {
+    if (g_bridgeThread) {
+        return;
+    }
+    g_bridgeStop = false;
+    g_bridgeWake = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!g_bridgeWake) {
+        return;
+    }
+    g_bridgeThread =
+        CreateThread(nullptr, 0, BridgeThreadProc, nullptr, 0, nullptr);
+    if (!g_bridgeThread) {
+        CloseHandle(g_bridgeWake);
+        g_bridgeWake = nullptr;
+    }
+}
+
+void StopBridge() {
+    if (!g_bridgeThread) {
+        return;
+    }
+    g_bridgeStop = true;
+    SetEvent(g_bridgeWake);
+    WaitForSingleObject(g_bridgeThread, 5000);
+    CloseHandle(g_bridgeThread);
+    g_bridgeThread = nullptr;
+    CloseHandle(g_bridgeWake);
+    g_bridgeWake = nullptr;
+    AcquireSRWLockExclusive(&g_bridgeLock);
+    g_bridgeItems.clear();
+    g_bridgeBrowsers.clear();
+    g_bridgeOutbox.clear();
+    ReleaseSRWLockExclusive(&g_bridgeLock);
+}
+
 DWORD WINAPI DownloadsThreadProc(LPVOID started) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     MSG msg;
@@ -10285,6 +10886,11 @@ DWORD WINAPI DownloadsThreadProc(LPVOID started) {
 }
 
 void StartDownloads() {
+    if (g_settings.dockBrowserBridge) {
+        StartBridge();
+    } else {
+        StopBridge();
+    }
     if (g_downloadsThread) {
         return;
     }
@@ -10303,6 +10909,7 @@ void StartDownloads() {
 }
 
 void StopDownloads() {
+    StopBridge();
     if (!g_downloadsThread) {
         return;
     }
@@ -14268,6 +14875,8 @@ void LoadSettings() {
     g_settings.dockIslandStyle = Wh_GetIntSetting(L"dock.islandStyle") != 0;
     g_settings.dockPinButton = Wh_GetIntSetting(L"dock.pinButton") != 0;
     g_settings.dockDownloads = Wh_GetIntSetting(L"dock.downloads") != 0;
+    g_settings.dockBrowserBridge =
+        Wh_GetIntSetting(L"dock.browserBridge") != 0;
     if (g_settings.dockIslandStyle) {
         g_settings.bottomGap = 0;
     }

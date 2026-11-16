@@ -77,7 +77,7 @@ test("nextDelay", () => { assert.equal(nextDelay(5000), 10000); assert.equal(nex
   - `void BridgeSend(int client, PCWSTR type, long long id);` — enfileira e sinaliza o evento.
   - `void StartBridge(); void StopBridge();`
   - Ao mudar a lista: chama `PokeDockRendering()` e posta `kBridgeChanged = WM_APP + 11` para a thread do painel (`g_downloadsThreadId`).
-- Handshake: `Sec-WebSocket-Accept = base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC65B11"))`.
+- Handshake: `Sec-WebSocket-Accept = base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`.
 - Frames: aceitar texto mascarado (FIN/continuação), `ping`→`pong`, `close`→fechar; enviar texto sem máscara. Limite 1 MB por mensagem.
 
 - [ ] **Step 1:** Escrever `tools/bridge-test.ps1` (ClientWebSocket .NET com `Options.SetRequestHeader("Origin", ...)`): (a) Origin `chrome-extension://test` → conecta, manda `hello` + `downloads` com 1 item, recebe nada e fecha limpo → imprime `OK accept`; (b) Origin `https://example.com` → falha no connect → imprime `OK reject`.
