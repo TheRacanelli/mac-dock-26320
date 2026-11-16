@@ -65,8 +65,12 @@ function connect() {
     send({ type: "hello", browser: browserName, version: 1 });
     sendDownloads();
     clearInterval(pingTimer);
-    // (Also keeps Chrome's service worker awake.)
-    pingTimer = setInterval(() => send({ type: "ping" }), 20000);
+    // (Also keeps Chrome's service worker awake; in Zen, an event of the
+    // extension's own every 20 s keeps its background page from idling.)
+    pingTimer = setInterval(() => {
+      send({ type: "ping" });
+      chrome.storage?.session?.set({ alive: Date.now() }).catch(() => {});
+    }, 20000);
   };
   socket.onmessage = (event) => {
     const command = parseCommand(event.data);
@@ -86,6 +90,8 @@ function connect() {
 chrome.downloads.onCreated.addListener(sendDownloads);
 chrome.downloads.onChanged.addListener(sendDownloads);
 chrome.downloads.onErased.addListener(sendDownloads);
+// (The keep-alive's event: nothing to do, receiving it is the point.)
+chrome.storage?.onChanged?.addListener(() => {});
 // Wakes the extension now and then, in case the dock came back.
 chrome.alarms.create("mac-dock-reconnect", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(connect);

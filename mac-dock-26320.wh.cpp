@@ -10367,6 +10367,24 @@ void HideDownloadsPanel() {
 }
 
 void OpenInFolder(const std::wstring& path) {
+    // (A download still under way may only exist with the browser's suffix;
+    // with none of them, its folder.)
+    if (GetFileAttributes(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        for (PCWSTR suffix : {L".crdownload", L".part"}) {
+            const std::wstring partial = path + suffix;
+            if (GetFileAttributes(partial.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                OpenInFolder(partial);
+                return;
+            }
+        }
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            const std::wstring folder = path.substr(0, slash);
+            ShellExecute(nullptr, L"open", folder.c_str(), nullptr, nullptr,
+                         SW_SHOWNORMAL);
+        }
+        return;
+    }
     const std::wstring args = L"/select,\"" + path + L"\"";
     ShellExecute(nullptr, nullptr, L"explorer.exe", args.c_str(), nullptr,
                  SW_SHOWNORMAL);
@@ -10381,7 +10399,10 @@ constexpr char kExtensionManifest[] = R"MDX({
   "name": "Mac Dock Downloads",
   "version": "1.0.0",
   "description": "Shows the browser's downloads in the Mac Dock (Windhawk) and lets it pause, resume and cancel them.",
-  "permissions": ["downloads", "alarms"],
+  "permissions": ["downloads", "alarms", "storage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'"
+  },
   "background": {
     "service_worker": "background.js",
     "scripts": ["background.js"],
@@ -10510,8 +10531,12 @@ function connect() {
     send({ type: "hello", browser: browserName, version: 1 });
     sendDownloads();
     clearInterval(pingTimer);
-    // (Also keeps Chrome's service worker awake.)
-    pingTimer = setInterval(() => send({ type: "ping" }), 20000);
+    // (Also keeps Chrome's service worker awake; in Zen, an event of the
+    // extension's own every 20 s keeps its background page from idling.)
+    pingTimer = setInterval(() => {
+      send({ type: "ping" });
+      chrome.storage?.session?.set({ alive: Date.now() }).catch(() => {});
+    }, 20000);
   };
   socket.onmessage = (event) => {
     const command = parseCommand(event.data);
@@ -10531,6 +10556,8 @@ function connect() {
 chrome.downloads.onCreated.addListener(sendDownloads);
 chrome.downloads.onChanged.addListener(sendDownloads);
 chrome.downloads.onErased.addListener(sendDownloads);
+// (The keep-alive's event: nothing to do, receiving it is the point.)
+chrome.storage?.onChanged?.addListener(() => {});
 // Wakes the extension now and then, in case the dock came back.
 chrome.alarms.create("mac-dock-reconnect", { periodInMinutes: 1 });
 chrome.alarms.onAlarm.addListener(connect);
@@ -10600,7 +10627,7 @@ std::wstring AppPath(PCWSTR exe) {
 }
 
 void CopyToClipboard(const std::wstring& text) {
-    if (!OpenClipboard(nullptr)) {
+    if (!OpenClipboard(g_downloadsWnd)) {
         return;
     }
     EmptyClipboard();
@@ -11077,7 +11104,19 @@ void BridgeForget(int key) {
     BridgeNotify();
 }
 
+void BridgeHandleMessageUnsafe(BridgeClient& client, const std::string& text);
+
+// (C++/WinRT's GetNamed* throw when a field is there with another type: a
+// bad message is ignored, never a crash of Explorer.)
 void BridgeHandleMessage(BridgeClient& client, const std::string& text) {
+    try {
+        BridgeHandleMessageUnsafe(client, text);
+    } catch (...) {
+        IslandLog(L"Browser bridge: a message was ignored");
+    }
+}
+
+void BridgeHandleMessageUnsafe(BridgeClient& client, const std::string& text) {
     using namespace winrt::Windows::Data::Json;
     JsonObject message{nullptr};
     if (!JsonObject::TryParse(winrt::to_hstring(text), message)) {

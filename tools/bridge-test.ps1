@@ -35,6 +35,23 @@ try {
     $failed = $true
 }
 
+# (c) Wrongly typed fields: the dock (Explorer) must survive and keep talking.
+try {
+    $socket = Connect 'chrome-extension://bridgetest'
+    SendText $socket '{"type":5}'
+    SendText $socket '{"type":"hello","browser":7}'
+    SendText $socket '{"type":"downloads","items":[{"id":null,"name":"x","paused":"no"}]}'
+    SendText $socket '{"type":"downloads","items":"nope"}'
+    Start-Sleep -Milliseconds 500
+    $again = Connect 'chrome-extension://bridgetest2'
+    if ($again.State -ne 'Open') { throw 'the dock stopped answering' }
+    $again.Dispose()
+    Write-Output 'OK malformed'
+} catch {
+    Write-Output "FAIL malformed: $($_.Exception.Message)"
+    $failed = $true
+}
+
 # (b) A web page's origin: refused.
 try {
     $socket = Connect 'https://example.com'

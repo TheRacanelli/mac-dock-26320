@@ -3,7 +3,10 @@
   "name": "Mac Dock Downloads",
   "version": "1.0.0",
   "description": "Shows the browser's downloads in the Mac Dock (Windhawk) and lets it pause, resume and cancel them.",
-  "permissions": ["downloads", "alarms"],
+  "permissions": ["downloads", "alarms", "storage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'"
+  },
   "background": {
     "service_worker": "background.js",
     "scripts": ["background.js"],
