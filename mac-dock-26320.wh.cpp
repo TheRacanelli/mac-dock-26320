@@ -2338,6 +2338,9 @@ std::atomic<bool> g_downloadsPanelOpen{false};
 // while).
 std::atomic<int> g_downloadsCount{0};
 std::atomic<ULONGLONG> g_downloadsBytes{0};
+// Their whole size, when every one of them knows it (0 otherwise): the icon
+// shows how far along they are.
+std::atomic<ULONGLONG> g_downloadsTotal{0};
 std::atomic<double> g_downloadsDoneAt{0};
 // The Downloads stack's icon's growth under the mouse (the render thread's).
 double g_downloadsMagnification = 1;
@@ -6326,7 +6329,14 @@ bool OnRenderingUnsafe(double now, double dt) {
                     bool doneText = false;
                     if (g_downloadsActive) {
                         const ULONGLONG bytes = g_downloadsBytes.load();
-                        text = bytes ? CompactDownloadSize(bytes)
+                        const ULONGLONG whole = g_downloadsTotal.load();
+                        WCHAR percent[16];
+                        swprintf_s(percent, L"%d%%",
+                                   whole ? (int)std::min<ULONGLONG>(
+                                               100, bytes * 100 / whole)
+                                         : 0);
+                        text = whole   ? std::wstring(percent)
+                               : bytes ? CompactDownloadSize(bytes)
                                      : std::wstring(L"\u2026");
                     } else if (now - g_downloadsDoneAt.load() < 4) {
                         text = L"Pronto";
@@ -9439,7 +9449,36 @@ struct DownloadItem {
     bool partial = false;
     HBITMAP thumb = nullptr;
     bool thumbTried = false;
+    // A browser's download (see the browser bridge): which connection, its
+    // id there, its size when known, and whether it's paused or may go on.
+    int bridgeClient = -1;
+    long long bridgeId = 0;
+    ULONGLONG total = 0;
+    bool paused = false;
+    bool canResume = false;
 };
+
+// A download as a browser's extension tells it (see the browser bridge,
+// further down).
+struct BridgeItem {
+    int client = 0;
+    long long id = 0;
+    std::wstring path;
+    std::wstring name;
+    ULONGLONG bytes = 0;
+    ULONGLONG total = 0;
+    bool paused = false;
+    bool canResume = false;
+    bool interrupted = false;
+};
+// Something a browser said changed the list (for the panel's thread).
+constexpr UINT kBridgeChanged = WM_APP + 11;
+std::vector<BridgeItem> BridgeSnapshot();
+bool BridgeConnected(PCWSTR browser);
+void BridgeSend(int client, PCWSTR type, long long id);
+// When a download was cancelled from the panel (its going away isn't one
+// finishing: no "Pronto").
+double g_downloadsCancelledAt = 0;
 
 HANDLE g_downloadsThread;
 DWORD g_downloadsThreadId;
@@ -9517,6 +9556,49 @@ void FreeDownloadThumbs(std::vector<DownloadItem>& items) {
 
 void PlaceDownloadsPanel();
 
+// The browsers' downloads (see the browser bridge) join the files: each one
+// takes the place of its unfinished file (same name without ".crdownload" or
+// ".part"), or shows on its own (saved somewhere else).
+void MergeBridgeDownloads(std::vector<DownloadItem>& found) {
+    const std::vector<BridgeItem> bridge = BridgeSnapshot();
+    if (bridge.empty()) {
+        return;
+    }
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    for (const auto& entry : bridge) {
+        DownloadItem item;
+        item.path = entry.path;
+        item.name = entry.name;
+        item.size = entry.bytes;
+        item.total = entry.total;
+        item.time = now;
+        item.partial = true;
+        item.paused = entry.paused || entry.interrupted;
+        item.canResume = entry.canResume;
+        item.bridgeClient = entry.client;
+        item.bridgeId = entry.id;
+        for (auto it = found.begin(); it != found.end(); ++it) {
+            if (!it->partial || it->bridgeClient >= 0) {
+                continue;
+            }
+            std::wstring finalPath = it->path;
+            for (PCWSTR suffix : {L".crdownload", L".part"}) {
+                if (EndsWithI(finalPath, suffix)) {
+                    finalPath.resize(finalPath.size() - wcslen(suffix));
+                }
+            }
+            if (_wcsicmp(finalPath.c_str(), entry.path.c_str()) == 0) {
+                // (Shown in its folder: the file that's there.)
+                item.path = it->path;
+                found.erase(it);
+                break;
+            }
+        }
+        found.push_back(std::move(item));
+    }
+}
+
 void ScanDownloads() {
     std::vector<DownloadItem> found;
     if (!g_downloadsDir.empty()) {
@@ -9573,10 +9655,8 @@ void ScanDownloads() {
         }
         return false;
     });
-    const int partials = (int)partialNames.size();
     // (A growing file's size in the folder's listing lags behind: asked of
     // the file itself.)
-    ULONGLONG partialBytes = 0;
     for (auto& item : found) {
         if (!item.partial) {
             continue;
@@ -9592,7 +9672,26 @@ void ScanDownloads() {
             }
             CloseHandle(file);
         }
+    }
+    MergeBridgeDownloads(found);
+    // Downloading (paused ones included, for the panel), and how much.
+    int partials = 0;
+    bool running = false;
+    ULONGLONG partialBytes = 0;
+    ULONGLONG partialTotal = 0;
+    bool totalKnown = true;
+    for (const auto& item : found) {
+        if (!item.partial) {
+            continue;
+        }
+        partials++;
+        if (item.paused) {
+            continue;
+        }
+        running = true;
         partialBytes += item.size;
+        partialTotal += item.total;
+        totalKnown = totalKnown && item.total > 0;
     }
     std::sort(found.begin(), found.end(),
               [](const DownloadItem& a, const DownloadItem& b) {
@@ -9627,11 +9726,14 @@ void ScanDownloads() {
     bool poke = false;
     const double now = NowSeconds();
     if (partials < g_downloadsPartials) {
-        g_downloadsBounceAt = now;
-        g_downloadsDoneAt = now;
+        // (Cancelled from the panel a moment ago: not finished.)
+        if (now - g_downloadsCancelledAt > 5) {
+            g_downloadsBounceAt = now;
+            g_downloadsDoneAt = now;
+        }
         poke = true;
     } else if (partials > g_downloadsPartials ||
-               (partials > 0 && now - g_downloadsBounceAt.load() >= 3.5)) {
+               (running && now - g_downloadsBounceAt.load() >= 3.5)) {
         g_downloadsBounceAt = now;
         poke = true;
     }
@@ -9639,9 +9741,13 @@ void ScanDownloads() {
     if (g_downloadsBytes.exchange(partialBytes) != partialBytes) {
         poke = true;
     }
+    const ULONGLONG total = totalKnown ? partialTotal : 0;
+    if (g_downloadsTotal.exchange(total) != total) {
+        poke = true;
+    }
     g_downloadsPartials = partials;
-    if (g_downloadsActive != (partials > 0)) {
-        g_downloadsActive = partials > 0;
+    if (g_downloadsActive != running) {
+        g_downloadsActive = running;
         poke = true;
     }
     if (poke) {
@@ -9701,6 +9807,33 @@ RECT DownloadsFolderLinkRect() {
     GetClientRect(g_downloadsWnd, &client);
     return {client.right - DlPx(kDlPad + 96), DlPx(kDlPad),
             client.right - DlPx(kDlPad), DlPx(kDlPad + 28)};
+}
+
+// A browser's download's buttons: pause or resume (0) and cancel (1), in the
+// grid's tile's top right corner, at the list's row's right end.
+constexpr int kDlItemButton = 24;
+
+RECT DownloadButtonRect(int index, int which) {
+    const RECT tile = DownloadTileRect(index);
+    const int size = DlPx(kDlItemButton);
+    const int gap = DlPx(4);
+    int right;
+    int top;
+    if (DownloadsView() == 1) {
+        right = tile.right - DlPx(10);
+        top = tile.top + (tile.bottom - tile.top - size) / 2;
+    } else {
+        right = tile.right - DlPx(6);
+        top = tile.top + DlPx(6);
+    }
+    if (which == 0) {
+        right -= size + gap;
+    }
+    return {right - size, top, right, top + size};
+}
+
+bool HasDownloadButtons(const DownloadItem& item) {
+    return item.bridgeClient >= 0;
 }
 
 // The buttons that show the files in a grid (0) or a list (1), left of
@@ -9988,8 +10121,31 @@ void PaintDownloads(HWND hWnd, HDC target) {
             }
         }
 
+        const bool buttons = HasDownloadButtons(item);
+        const int percent =
+            item.total > 0
+                ? (int)std::min<ULONGLONG>(100, item.size * 100 / item.total)
+                : -1;
         std::wstring detail = FormatDownloadSize(item.size);
-        if (item.partial) {
+        if (item.partial && buttons) {
+            WCHAR text[32];
+            swprintf_s(text, L"%d%%", percent);
+            const std::wstring done = percent >= 0 ? text : L"";
+            if (list) {
+                detail = (item.paused ? L"Pausado" : L"Baixando\u2026") +
+                         std::wstring(done.empty() ? L"" : L" ") + done +
+                         L" \u00B7 " + detail +
+                         (item.total > 0
+                              ? L" de " + FormatDownloadSize(item.total)
+                              : L"");
+            } else if (item.paused) {
+                detail = done.empty() ? L"Pausado" : L"Pausado \u00B7 " + done;
+            } else {
+                detail = done.empty() ? L"Baixando\u2026 " + detail
+                                      : done + L" de " +
+                                            FormatDownloadSize(item.total);
+            }
+        } else if (item.partial) {
             detail = L"Baixando\u2026 " + detail;
         } else if (list) {
             const std::wstring when = FormatDownloadTime(item.time);
@@ -9998,11 +10154,53 @@ void PaintDownloads(HWND hWnd, HDC target) {
             }
         }
 
+        // How far along it is, under the picture (grid) or the text (list).
+        const int barHeight = DlPx(3);
+        auto drawBar = [&](int left, int top, int right) {
+            if (percent < 0) {
+                return;
+            }
+            const RECT track{left, top, right, top + barHeight};
+            FillRounded(hdc, track, barHeight, RGB(52, 52, 52));
+            const RECT done{left, top,
+                            left + std::max(barHeight,
+                                            (right - left) * percent / 100),
+                            top + barHeight};
+            FillRounded(hdc, done, barHeight,
+                        item.paused ? kGray : kBlue);
+        };
+        // Pause or resume, and cancel.
+        auto drawButtons = [&]() {
+            if (!buttons) {
+                return;
+            }
+            SelectObject(hdc, g_dlIconFont);
+            for (int which = 0; which < 2; which++) {
+                if (which == 0 && item.paused && !item.canResume) {
+                    continue;
+                }
+                RECT button = DownloadButtonRect(i, which);
+                const bool hovered = g_downloadsHover == -100 - 2 * i - which;
+                FillRounded(hdc, button, button.right - button.left,
+                            hovered ? RGB(80, 80, 80) : RGB(48, 48, 48));
+                SetTextColor(hdc, kWhite);
+                PCWSTR glyph = which == 1        ? L"\uE711"
+                               : item.paused     ? L"\uE768"
+                                                 : L"\uE769";
+                DrawText(hdc, glyph, -1, &button,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+        };
+
         if (list) {
             const int textLeft = box.right + DlPx(12);
-            const int textRight = tile.right - DlPx(12);
-            const int textTop = tile.top + (tile.bottom - tile.top -
-                                            nameLine - smallLine - DlPx(2)) / 2;
+            const int textRight =
+                buttons ? DownloadButtonRect(i, 0).left - DlPx(10)
+                        : tile.right - DlPx(12);
+            const int textTop =
+                tile.top + (tile.bottom - tile.top - nameLine - smallLine -
+                            DlPx(2) - (percent >= 0 ? barHeight + DlPx(4) : 0)) /
+                               2;
             SelectObject(hdc, g_dlFont);
             SetTextColor(hdc, kWhite);
             const std::wstring name =
@@ -10017,6 +10215,10 @@ void PaintDownloads(HWND hWnd, HDC target) {
             DrawText(hdc, detail.c_str(), -1, &detailRect,
                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS |
                          DT_NOPREFIX);
+            if (buttons) {
+                drawBar(textLeft, detailRect.bottom + DlPx(4), textRight);
+            }
+            drawButtons();
             continue;
         }
 
@@ -10046,6 +10248,10 @@ void PaintDownloads(HWND hWnd, HDC target) {
         DrawText(hdc, detail.c_str(), -1, &detailRect,
                  DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS |
                      DT_NOPREFIX);
+        if (buttons) {
+            drawBar(box.left, box.bottom + DlPx(1), box.right);
+        }
+        drawButtons();
     }
 
     SelectObject(hdc, oldFont);
@@ -10056,7 +10262,8 @@ void PaintDownloads(HWND hWnd, HDC target) {
 }
 
 // What's at `pt`: a file's index, -2 for "Abrir pasta", -3 and -4 for the
-// grid and list buttons, -1 for nothing.
+// grid and list buttons, -100 - 2 * index for a download's pause or resume
+// and one less for its cancel, -1 for nothing.
 int DownloadsHitTest(POINT pt) {
     const RECT link = DownloadsFolderLinkRect();
     if (PtInRect(&link, pt)) {
@@ -10066,6 +10273,17 @@ int DownloadsHitTest(POINT pt) {
         const RECT button = DownloadsViewButtonRect(view);
         if (PtInRect(&button, pt)) {
             return -3 - view;
+        }
+    }
+    for (int i = 0; i < (int)g_downloadItems.size(); i++) {
+        if (!HasDownloadButtons(g_downloadItems[i])) {
+            continue;
+        }
+        for (int which = 0; which < 2; which++) {
+            const RECT button = DownloadButtonRect(i, which);
+            if (PtInRect(&button, pt)) {
+                return -100 - 2 * i - which;
+            }
         }
     }
     for (int i = 0; i < (int)g_downloadItems.size(); i++) {
@@ -10132,7 +10350,23 @@ LRESULT CALLBACK DownloadsWndProc(HWND hWnd,
         case WM_RBUTTONUP: {
             const int hit =
                 DownloadsHitTest({(short)LOWORD(lParam), (short)HIWORD(lParam)});
-            if (hit == -3 || hit == -4) {
+            if (hit <= -100) {
+                const int index = (-100 - hit) / 2;
+                const bool cancel = (-100 - hit) % 2 == 1;
+                if (msg == WM_LBUTTONUP &&
+                    index < (int)g_downloadItems.size()) {
+                    const DownloadItem& item = g_downloadItems[index];
+                    if (cancel) {
+                        g_downloadsCancelledAt = NowSeconds();
+                        BridgeSend(item.bridgeClient, L"cancel", item.bridgeId);
+                    } else if (item.paused) {
+                        BridgeSend(item.bridgeClient, L"resume",
+                                   item.bridgeId);
+                    } else {
+                        BridgeSend(item.bridgeClient, L"pause", item.bridgeId);
+                    }
+                }
+            } else if (hit == -3 || hit == -4) {
                 const int view = hit == -3 ? 0 : 1;
                 if (view != DownloadsView()) {
                     g_downloadsView = view;
@@ -10409,21 +10643,7 @@ std::string WsEncode(int opcode, const std::string& payload) {
 // BRIDGE-CORE-END
 
 constexpr USHORT kBridgePort = 47821;
-// Something a browser said changed the list (for the panel's thread).
-constexpr UINT kBridgeChanged = WM_APP + 11;
 constexpr int kBridgeMaxClients = 4;
-
-struct BridgeItem {
-    int client = 0;
-    long long id = 0;
-    std::wstring path;
-    std::wstring name;
-    ULONGLONG bytes = 0;
-    ULONGLONG total = 0;
-    bool paused = false;
-    bool canResume = false;
-    bool interrupted = false;
-};
 
 struct BridgeClient {
     SOCKET socket = INVALID_SOCKET;
@@ -10844,6 +11064,10 @@ DWORD WINAPI DownloadsThreadProc(LPVOID started) {
             if (msg.message == WM_QUIT) {
                 quit = true;
                 break;
+            }
+            if (!msg.hwnd && msg.message == kBridgeChanged) {
+                ScanDownloads();
+                continue;
             }
             if (!msg.hwnd && msg.message == kDownloadsToggle) {
                 if (g_downloadsWnd && IsWindowVisible(g_downloadsWnd)) {
