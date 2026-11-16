@@ -4,13 +4,13 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock10
+// @version         3.1.0-dock13
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
 // @donateUrl       https://github.com/sponsors/cesarkali
 // @include         explorer.exe
-// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lshell32 -ldwmapi -lcomctl32 -lgdi32 -lmsimg32 -ld2d1 -ldwrite -lwlanapi -luuid -lversion -lbthprops -ldxva2 -lshlwapi -lwinhttp -lwinmm -liphlpapi -lshcore -lcomdlg32 -limm32 -lsetupapi -lcfgmgr32 -luserenv
+// @compilerOptions -DWIN32_LEAN_AND_MEAN -lole32 -loleaut32 -lruntimeobject -lshell32 -ldwmapi -lcomctl32 -lgdi32 -lmsimg32 -ld2d1 -ldwrite -lwlanapi -luuid -lversion -lbthprops -ldxva2 -lshlwapi -lwinhttp -lwinmm -liphlpapi -lshcore -lcomdlg32 -limm32 -lsetupapi -lcfgmgr32 -luserenv -lws2_32 -lbcrypt
 // @license         GPL-3.0
 // ==/WindhawkMod==
 
@@ -476,6 +476,11 @@ O código que alcança o XAML da barra é baseado no mod
     $name:pt-BR: Pasta de downloads na dock
     $description: An icon at the dock's right end that opens a panel with the latest files in Downloads, like macOS's stack. Files still downloading in Chrome, Edge, Zen or Firefox show as they grow, the icon turns blue, hops and shows how much came down meanwhile, and it bounces when one finishes
     $description:pt-BR: Um ícone na ponta direita da dock que abre um painel com os arquivos mais recentes da pasta Downloads, como a pilha do macOS. Arquivos ainda baixando no Chrome, Edge, Zen ou Firefox aparecem crescendo, o ícone fica azul, pula e mostra quanto já baixou enquanto isso, e pula de novo quando um termina
+  - browserBridge: true
+    $name: Browser bridge (pause/cancel downloads)
+    $name:pt-BR: Ponte com navegadores (pausar/cancelar downloads)
+    $description: With the "Mac Dock Downloads" extension in Chrome or Zen, the Downloads panel shows their downloads with their progress and can pause, resume and cancel them. The dock listens only on this computer (127.0.0.1:27821) and only to browser extensions
+    $description:pt-BR: Com a extensão "Mac Dock Downloads" no Chrome ou no Zen, o painel de Downloads mostra os downloads deles com a porcentagem e consegue pausar, continuar e cancelar. A dock só escuta neste computador (127.0.0.1:27821) e só extensões de navegador
   - backgroundOpacity: 50
     $name: Background color (%)
     $name:pt-BR: Cor do fundo (%)
@@ -806,6 +811,7 @@ O código que alcança o XAML da barra é baseado no mod
 #include <propsys.h>
 #include <wbemidl.h>
 #include <wincodec.h>
+#include <bcrypt.h>
 #include <winhttp.h>
 #include <winioctl.h>
 #include <wlanapi.h>
@@ -845,6 +851,7 @@ O código que alcança o XAML da barra é baseado no mod
 
 #include <winrt/Windows.Devices.Geolocation.h>
 #include <winrt/Windows.Devices.Radios.h>
+#include <winrt/Windows.Data.Json.h>
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.Graphics.Effects.h>
@@ -952,6 +959,8 @@ struct {
     bool dockPinButton;
     // The Downloads stack (dock.downloads).
     bool dockDownloads;
+    // Its bridge to the browsers' extension (dock.browserBridge).
+    bool dockBrowserBridge;
     double backgroundOpacity;
     int showDuration;
     int hideDuration;
@@ -2329,6 +2338,9 @@ std::atomic<bool> g_downloadsPanelOpen{false};
 // while).
 std::atomic<int> g_downloadsCount{0};
 std::atomic<ULONGLONG> g_downloadsBytes{0};
+// Their whole size, when every one of them knows it (0 otherwise): the icon
+// shows how far along they are.
+std::atomic<ULONGLONG> g_downloadsTotal{0};
 std::atomic<double> g_downloadsDoneAt{0};
 // The Downloads stack's icon's growth under the mouse (the render thread's).
 double g_downloadsMagnification = 1;
@@ -6317,7 +6329,14 @@ bool OnRenderingUnsafe(double now, double dt) {
                     bool doneText = false;
                     if (g_downloadsActive) {
                         const ULONGLONG bytes = g_downloadsBytes.load();
-                        text = bytes ? CompactDownloadSize(bytes)
+                        const ULONGLONG whole = g_downloadsTotal.load();
+                        WCHAR percent[16];
+                        swprintf_s(percent, L"%d%%",
+                                   whole ? (int)std::min<ULONGLONG>(
+                                               100, bytes * 100 / whole)
+                                         : 0);
+                        text = whole   ? std::wstring(percent)
+                               : bytes ? CompactDownloadSize(bytes)
                                      : std::wstring(L"\u2026");
                     } else if (now - g_downloadsDoneAt.load() < 4) {
                         text = L"Pronto";
@@ -9421,6 +9440,8 @@ constexpr int kDlListWidth = 440;
 constexpr int kDlRowHeight = 52;
 constexpr int kDlListThumb = 34;
 constexpr int kDlButton = 30;
+// The footer with the browsers' extension (dock.browserBridge).
+constexpr int kDlFooter = 42;
 
 struct DownloadItem {
     std::wstring path;
@@ -9430,7 +9451,36 @@ struct DownloadItem {
     bool partial = false;
     HBITMAP thumb = nullptr;
     bool thumbTried = false;
+    // A browser's download (see the browser bridge): which connection, its
+    // id there, its size when known, and whether it's paused or may go on.
+    int bridgeClient = -1;
+    long long bridgeId = 0;
+    ULONGLONG total = 0;
+    bool paused = false;
+    bool canResume = false;
 };
+
+// A download as a browser's extension tells it (see the browser bridge,
+// further down).
+struct BridgeItem {
+    int client = 0;
+    long long id = 0;
+    std::wstring path;
+    std::wstring name;
+    ULONGLONG bytes = 0;
+    ULONGLONG total = 0;
+    bool paused = false;
+    bool canResume = false;
+    bool interrupted = false;
+};
+// Something a browser said changed the list (for the panel's thread).
+constexpr UINT kBridgeChanged = WM_APP + 11;
+std::vector<BridgeItem> BridgeSnapshot();
+bool BridgeConnected(PCWSTR browser);
+void BridgeSend(int client, PCWSTR type, long long id);
+// When a download was cancelled from the panel (its going away isn't one
+// finishing: no "Pronto").
+double g_downloadsCancelledAt = 0;
 
 HANDLE g_downloadsThread;
 DWORD g_downloadsThreadId;
@@ -9508,6 +9558,99 @@ void FreeDownloadThumbs(std::vector<DownloadItem>& items) {
 
 void PlaceDownloadsPanel();
 
+// The browsers' downloads (see the browser bridge) join the files: each one
+// takes the place of its unfinished file (same name without ".crdownload" or
+// ".part"), or shows on its own (saved somewhere else).
+void MergeBridgeDownloads(std::vector<DownloadItem>& found) {
+    const std::vector<BridgeItem> bridge = BridgeSnapshot();
+    if (bridge.empty()) {
+        return;
+    }
+    FILETIME now{};
+    GetSystemTimeAsFileTime(&now);
+    // Unfinished files no browser's download claimed by name yet (Chrome's
+    // "Unconfirmed 123456.crdownload" doesn't carry the final name).
+    auto unclaimedPartial = [&](const BridgeItem& entry) {
+        const std::wstring folder =
+            entry.path.substr(0, entry.path.find_last_of(L"\\/") + 1);
+        auto best = found.end();
+        ULONGLONG bestGap = 0;
+        for (auto it = found.begin(); it != found.end(); ++it) {
+            if (!it->partial || it->bridgeClient >= 0 ||
+                _wcsnicmp(it->path.c_str(), folder.c_str(), folder.size()) !=
+                    0 ||
+                it->path.find_first_of(L"\\/", folder.size()) !=
+                    std::wstring::npos) {
+                continue;
+            }
+            const ULONGLONG gap = it->size > entry.bytes
+                                      ? it->size - entry.bytes
+                                      : entry.bytes - it->size;
+            if (best == found.end() || gap < bestGap) {
+                best = it;
+                bestGap = gap;
+            }
+        }
+        // (Sizes a little apart: the file and the browser's count aren't
+        // read at the same moment.)
+        const ULONGLONG slack =
+            std::max<ULONGLONG>(64ull * 1024 * 1024, entry.bytes / 4);
+        return best != found.end() && bestGap <= slack ? best : found.end();
+    };
+    std::vector<bool> matched(bridge.size(), false);
+    for (int pass = 0; pass < 2; pass++) {
+    for (size_t index = 0; index < bridge.size(); index++) {
+        const BridgeItem& entry = bridge[index];
+        if (matched[index]) {
+            continue;
+        }
+        DownloadItem item;
+        item.path = entry.path;
+        item.name = entry.name;
+        item.size = entry.bytes;
+        item.total = entry.total;
+        item.time = now;
+        item.partial = true;
+        item.paused = entry.paused || entry.interrupted;
+        item.canResume = entry.canResume;
+        item.bridgeClient = entry.client;
+        item.bridgeId = entry.id;
+        // First by name (all of them), then by size (what's left), so a
+        // download whose file has its name never loses it to another.
+        auto file = found.end();
+        if (pass == 0) {
+            for (auto it = found.begin(); it != found.end(); ++it) {
+                if (!it->partial || it->bridgeClient >= 0) {
+                    continue;
+                }
+                std::wstring finalPath = it->path;
+                for (PCWSTR suffix : {L".crdownload", L".part"}) {
+                    if (EndsWithI(finalPath, suffix)) {
+                        finalPath.resize(finalPath.size() - wcslen(suffix));
+                    }
+                }
+                if (_wcsicmp(finalPath.c_str(), entry.path.c_str()) == 0) {
+                    file = it;
+                    break;
+                }
+            }
+            if (file == found.end()) {
+                continue;
+            }
+        } else {
+            file = unclaimedPartial(entry);
+        }
+        if (file != found.end()) {
+            // (Shown in its folder: the file that's there.)
+            item.path = file->path;
+            found.erase(file);
+        }
+        matched[index] = true;
+        found.push_back(std::move(item));
+    }
+    }
+}
+
 void ScanDownloads() {
     std::vector<DownloadItem> found;
     if (!g_downloadsDir.empty()) {
@@ -9564,10 +9707,8 @@ void ScanDownloads() {
         }
         return false;
     });
-    const int partials = (int)partialNames.size();
     // (A growing file's size in the folder's listing lags behind: asked of
     // the file itself.)
-    ULONGLONG partialBytes = 0;
     for (auto& item : found) {
         if (!item.partial) {
             continue;
@@ -9583,7 +9724,26 @@ void ScanDownloads() {
             }
             CloseHandle(file);
         }
+    }
+    MergeBridgeDownloads(found);
+    // Downloading (paused ones included, for the panel), and how much.
+    int partials = 0;
+    bool running = false;
+    ULONGLONG partialBytes = 0;
+    ULONGLONG partialTotal = 0;
+    bool totalKnown = true;
+    for (const auto& item : found) {
+        if (!item.partial) {
+            continue;
+        }
+        partials++;
+        if (item.paused) {
+            continue;
+        }
+        running = true;
         partialBytes += item.size;
+        partialTotal += item.total;
+        totalKnown = totalKnown && item.total > 0;
     }
     std::sort(found.begin(), found.end(),
               [](const DownloadItem& a, const DownloadItem& b) {
@@ -9618,11 +9778,14 @@ void ScanDownloads() {
     bool poke = false;
     const double now = NowSeconds();
     if (partials < g_downloadsPartials) {
-        g_downloadsBounceAt = now;
-        g_downloadsDoneAt = now;
+        // (Cancelled from the panel a moment ago: not finished.)
+        if (now - g_downloadsCancelledAt > 5) {
+            g_downloadsBounceAt = now;
+            g_downloadsDoneAt = now;
+        }
         poke = true;
     } else if (partials > g_downloadsPartials ||
-               (partials > 0 && now - g_downloadsBounceAt.load() >= 3.5)) {
+               (running && now - g_downloadsBounceAt.load() >= 3.5)) {
         g_downloadsBounceAt = now;
         poke = true;
     }
@@ -9630,9 +9793,13 @@ void ScanDownloads() {
     if (g_downloadsBytes.exchange(partialBytes) != partialBytes) {
         poke = true;
     }
+    const ULONGLONG total = totalKnown ? partialTotal : 0;
+    if (g_downloadsTotal.exchange(total) != total) {
+        poke = true;
+    }
     g_downloadsPartials = partials;
-    if (g_downloadsActive != (partials > 0)) {
-        g_downloadsActive = partials > 0;
+    if (g_downloadsActive != running) {
+        g_downloadsActive = running;
         poke = true;
     }
     if (poke) {
@@ -9694,6 +9861,48 @@ RECT DownloadsFolderLinkRect() {
             client.right - DlPx(kDlPad), DlPx(kDlPad + 28)};
 }
 
+bool DownloadsFooterShown() {
+    return g_settings.dockBrowserBridge;
+}
+
+// The footer's halves: Chrome (0) and Zen (1), connected or to install.
+RECT DownloadsFooterRect(int which) {
+    RECT client{};
+    GetClientRect(g_downloadsWnd, &client);
+    const int top = client.bottom - DlPx(kDlPad + 28);
+    const int left = DlPx(kDlPad);
+    const int half = (client.right - DlPx(kDlPad * 2)) / 2;
+    const int x = left + which * half;
+    return {x, top, x + half - (which == 0 ? DlPx(6) : 0), top + DlPx(28)};
+}
+
+// A browser's download's buttons: pause or resume (0) and cancel (1), in the
+// grid's tile's top right corner, at the list's row's right end.
+constexpr int kDlItemButton = 24;
+
+RECT DownloadButtonRect(int index, int which) {
+    const RECT tile = DownloadTileRect(index);
+    const int size = DlPx(kDlItemButton);
+    const int gap = DlPx(4);
+    int right;
+    int top;
+    if (DownloadsView() == 1) {
+        right = tile.right - DlPx(10);
+        top = tile.top + (tile.bottom - tile.top - size) / 2;
+    } else {
+        right = tile.right - DlPx(6);
+        top = tile.top + DlPx(6);
+    }
+    if (which == 0) {
+        right -= size + gap;
+    }
+    return {right - size, top, right, top + size};
+}
+
+bool HasDownloadButtons(const DownloadItem& item) {
+    return item.bridgeClient >= 0;
+}
+
 // The buttons that show the files in a grid (0) or a list (1), left of
 // "Abrir pasta".
 RECT DownloadsViewButtonRect(int view) {
@@ -9727,7 +9936,8 @@ void PlaceDownloadsPanel() {
     const int width = DlPx(kDlPad * 2 + (list ? kDlListWidth
                                               : kDownloadsColumns * kDlTileWidth));
     const int height = DlPx(kDlPad * 2 + kDlHeader +
-                            DownloadsRows() * (list ? kDlRowHeight : kDlTileHeight));
+                            DownloadsRows() * (list ? kDlRowHeight : kDlTileHeight) +
+                            (DownloadsFooterShown() ? kDlFooter : 0));
     const int margin = DlPx(10);
     int left = g_downloadsAnchor.x - width / 2;
     left = std::min(left, (int)info.rcMonitor.right - margin - width);
@@ -9933,7 +10143,8 @@ void PaintDownloads(HWND hWnd, HDC target) {
 
     if (g_downloadItems.empty()) {
         RECT empty{0, DlPx(kDlPad + kDlHeader), client.right,
-                   client.bottom - DlPx(kDlPad)};
+                   client.bottom - DlPx(kDlPad) -
+                       (DownloadsFooterShown() ? DlPx(kDlFooter) : 0)};
         SetTextColor(hdc, kGray);
         DrawText(hdc, L"Nenhum arquivo em Downloads", -1, &empty,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -9979,8 +10190,31 @@ void PaintDownloads(HWND hWnd, HDC target) {
             }
         }
 
+        const bool buttons = HasDownloadButtons(item);
+        const int percent =
+            item.total > 0
+                ? (int)std::min<ULONGLONG>(100, item.size * 100 / item.total)
+                : -1;
         std::wstring detail = FormatDownloadSize(item.size);
-        if (item.partial) {
+        if (item.partial && buttons) {
+            WCHAR text[32];
+            swprintf_s(text, L"%d%%", percent);
+            const std::wstring done = percent >= 0 ? text : L"";
+            if (list) {
+                detail = (item.paused ? L"Pausado" : L"Baixando\u2026") +
+                         std::wstring(done.empty() ? L"" : L" ") + done +
+                         L" \u00B7 " + detail +
+                         (item.total > 0
+                              ? L" de " + FormatDownloadSize(item.total)
+                              : L"");
+            } else if (item.paused) {
+                detail = done.empty() ? L"Pausado" : L"Pausado \u00B7 " + done;
+            } else {
+                detail = done.empty() ? L"Baixando\u2026 " + detail
+                                      : done + L" de " +
+                                            FormatDownloadSize(item.total);
+            }
+        } else if (item.partial) {
             detail = L"Baixando\u2026 " + detail;
         } else if (list) {
             const std::wstring when = FormatDownloadTime(item.time);
@@ -9989,11 +10223,53 @@ void PaintDownloads(HWND hWnd, HDC target) {
             }
         }
 
+        // How far along it is, under the picture (grid) or the text (list).
+        const int barHeight = DlPx(3);
+        auto drawBar = [&](int left, int top, int right) {
+            if (percent < 0) {
+                return;
+            }
+            const RECT track{left, top, right, top + barHeight};
+            FillRounded(hdc, track, barHeight, RGB(52, 52, 52));
+            const RECT done{left, top,
+                            left + std::max(barHeight,
+                                            (right - left) * percent / 100),
+                            top + barHeight};
+            FillRounded(hdc, done, barHeight,
+                        item.paused ? kGray : kBlue);
+        };
+        // Pause or resume, and cancel.
+        auto drawButtons = [&]() {
+            if (!buttons) {
+                return;
+            }
+            SelectObject(hdc, g_dlIconFont);
+            for (int which = 0; which < 2; which++) {
+                if (which == 0 && item.paused && !item.canResume) {
+                    continue;
+                }
+                RECT button = DownloadButtonRect(i, which);
+                const bool hovered = g_downloadsHover == -100 - 2 * i - which;
+                FillRounded(hdc, button, button.right - button.left,
+                            hovered ? RGB(80, 80, 80) : RGB(48, 48, 48));
+                SetTextColor(hdc, kWhite);
+                PCWSTR glyph = which == 1        ? L"\uE711"
+                               : item.paused     ? L"\uE768"
+                                                 : L"\uE769";
+                DrawText(hdc, glyph, -1, &button,
+                         DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+            }
+        };
+
         if (list) {
             const int textLeft = box.right + DlPx(12);
-            const int textRight = tile.right - DlPx(12);
-            const int textTop = tile.top + (tile.bottom - tile.top -
-                                            nameLine - smallLine - DlPx(2)) / 2;
+            const int textRight =
+                buttons ? DownloadButtonRect(i, 0).left - DlPx(10)
+                        : tile.right - DlPx(12);
+            const int textTop =
+                tile.top + (tile.bottom - tile.top - nameLine - smallLine -
+                            DlPx(2) - (percent >= 0 ? barHeight + DlPx(4) : 0)) /
+                               2;
             SelectObject(hdc, g_dlFont);
             SetTextColor(hdc, kWhite);
             const std::wstring name =
@@ -10008,6 +10284,10 @@ void PaintDownloads(HWND hWnd, HDC target) {
             DrawText(hdc, detail.c_str(), -1, &detailRect,
                      DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS |
                          DT_NOPREFIX);
+            if (buttons) {
+                drawBar(textLeft, detailRect.bottom + DlPx(4), textRight);
+            }
+            drawButtons();
             continue;
         }
 
@@ -10037,6 +10317,38 @@ void PaintDownloads(HWND hWnd, HDC target) {
         DrawText(hdc, detail.c_str(), -1, &detailRect,
                  DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS |
                      DT_NOPREFIX);
+        if (buttons) {
+            drawBar(box.left, box.bottom + DlPx(1), box.right);
+        }
+        drawButtons();
+    }
+
+    // The extension: connected in each browser, or a button to install it.
+    if (DownloadsFooterShown()) {
+        const RECT chrome = DownloadsFooterRect(0);
+        const RECT line{DlPx(kDlPad), chrome.top - DlPx(8),
+                        client.right - DlPx(kDlPad), chrome.top - DlPx(7)};
+        HBRUSH lineBrush = CreateSolidBrush(RGB(40, 40, 40));
+        FillRect(hdc, &line, lineBrush);
+        DeleteObject(lineBrush);
+        SelectObject(hdc, g_dlSmallFont);
+        for (int which = 0; which < 2; which++) {
+            RECT box = DownloadsFooterRect(which);
+            const bool connected = BridgeConnected(which ? L"zen" : L"chrome");
+            const bool hovered = !connected && g_downloadsHover == -5 - which;
+            if (hovered) {
+                FillRounded(hdc, box, DlPx(10), kHover);
+            }
+            SetTextColor(hdc, connected ? RGB(0x5E, 0xD8, 0x7A)
+                              : hovered ? kWhite
+                                        : kBlue);
+            PCWSTR text = which ? (connected ? L"● Zen conectado"
+                                             : L"Instalar no Zen")
+                                : (connected ? L"● Chrome conectado"
+                                             : L"Instalar no Chrome");
+            DrawText(hdc, text, -1, &box,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
     }
 
     SelectObject(hdc, oldFont);
@@ -10047,8 +10359,19 @@ void PaintDownloads(HWND hWnd, HDC target) {
 }
 
 // What's at `pt`: a file's index, -2 for "Abrir pasta", -3 and -4 for the
-// grid and list buttons, -1 for nothing.
+// grid and list buttons, -5 and -6 for installing the extension in Chrome
+// and Zen, -100 - 2 * index for a download's pause or resume
+// and one less for its cancel, -1 for nothing.
 int DownloadsHitTest(POINT pt) {
+    if (DownloadsFooterShown()) {
+        for (int which = 0; which < 2; which++) {
+            const RECT box = DownloadsFooterRect(which);
+            if (PtInRect(&box, pt) &&
+                !BridgeConnected(which ? L"zen" : L"chrome")) {
+                return -5 - which;
+            }
+        }
+    }
     const RECT link = DownloadsFolderLinkRect();
     if (PtInRect(&link, pt)) {
         return -2;
@@ -10057,6 +10380,17 @@ int DownloadsHitTest(POINT pt) {
         const RECT button = DownloadsViewButtonRect(view);
         if (PtInRect(&button, pt)) {
             return -3 - view;
+        }
+    }
+    for (int i = 0; i < (int)g_downloadItems.size(); i++) {
+        if (!HasDownloadButtons(g_downloadItems[i])) {
+            continue;
+        }
+        for (int which = 0; which < 2; which++) {
+            const RECT button = DownloadButtonRect(i, which);
+            if (PtInRect(&button, pt)) {
+                return -100 - 2 * i - which;
+            }
         }
     }
     for (int i = 0; i < (int)g_downloadItems.size(); i++) {
@@ -10083,9 +10417,338 @@ void HideDownloadsPanel() {
 }
 
 void OpenInFolder(const std::wstring& path) {
+    // (A download still under way may only exist with the browser's suffix;
+    // with none of them, its folder.)
+    if (GetFileAttributes(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+        for (PCWSTR suffix : {L".crdownload", L".part"}) {
+            const std::wstring partial = path + suffix;
+            if (GetFileAttributes(partial.c_str()) != INVALID_FILE_ATTRIBUTES) {
+                OpenInFolder(partial);
+                return;
+            }
+        }
+        const size_t slash = path.find_last_of(L"\\/");
+        if (slash != std::wstring::npos) {
+            const std::wstring folder = path.substr(0, slash);
+            ShellExecute(nullptr, L"open", folder.c_str(), nullptr, nullptr,
+                         SW_SHOWNORMAL);
+        }
+        return;
+    }
     const std::wstring args = L"/select,\"" + path + L"\"";
     ShellExecute(nullptr, nullptr, L"explorer.exe", args.c_str(), nullptr,
                  SW_SHOWNORMAL);
+}
+
+// The browsers' extension ("Mac Dock Downloads"), the same as extension/ in
+// the mod's repository (tools/pack-extension.ps1 checks), written out by the
+// panel's "Instalar" buttons.
+// EXTENSION-FILE manifest.json
+constexpr char kExtensionManifest[] = R"MDX({
+  "manifest_version": 3,
+  "name": "Mac Dock Downloads",
+  "version": "1.0.0",
+  "description": "Shows the browser's downloads in the Mac Dock (Windhawk) and lets it pause, resume and cancel them.",
+  "permissions": ["downloads", "alarms", "storage"],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'"
+  },
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"],
+    "type": "module"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "mac-dock-downloads@racanelli",
+      "strict_min_version": "121.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  }
+}
+)MDX";
+// EXTENSION-FILE protocol.js
+constexpr char kExtensionProtocol[] = R"MDX(// Mac Dock Downloads: what the extension and the dock say to each other.
+
+export const PORT = 27821;
+const COMMANDS = ["pause", "resume", "cancel"];
+
+// A browser download as the dock wants it.
+export function toItem(d) {
+  const path = d.filename || "";
+  const parts = path.split(/[\\/]/);
+  return {
+    id: d.id,
+    path,
+    name: parts[parts.length - 1] || "",
+    bytes: d.bytesReceived || 0,
+    total: d.totalBytes > 0 ? d.totalBytes : 0,
+    state: d.state,
+    paused: !!d.paused,
+    canResume: !!d.canResume,
+  };
+}
+
+// Downloading now, or stopped but able to go on.
+export function isActive(d) {
+  return d.state === "in_progress" || (d.state === "interrupted" && !!d.canResume);
+}
+
+// A command from the dock, or null for anything else.
+export function parseCommand(text) {
+  let message;
+  try {
+    message = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!message || !COMMANDS.includes(message.type) || typeof message.id !== "number") {
+    return null;
+  }
+  return { type: message.type, id: message.id };
+}
+
+// How long to wait before trying the dock again.
+export function nextDelay(previousMs) {
+  return Math.min(previousMs * 2, 60000);
+}
+)MDX";
+// EXTENSION-FILE background.js
+constexpr char kExtensionBackground[] = R"MDX(// Mac Dock Downloads: tells the dock (Windhawk mod, ws://127.0.0.1:27821)
+// what's downloading and does what it asks: pause, resume, cancel.
+import { PORT, toItem, isActive, parseCommand, nextDelay } from "./protocol.js";
+
+const browserName = navigator.userAgent.includes("Firefox") ? "zen" : "chrome";
+let socket = null;
+let retryDelay = 5000;
+let retryTimer = null;
+let tickTimer = null;
+let pingTimer = null;
+
+function send(message) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+async function sendDownloads() {
+  const all = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 50 });
+  const active = all.filter(isActive);
+  send({ type: "downloads", items: active.map(toItem) });
+  // Every second only while something is downloading.
+  const downloading = active.some((d) => d.state === "in_progress" && !d.paused);
+  if (downloading && !tickTimer) {
+    tickTimer = setInterval(sendDownloads, 1000);
+  } else if (!downloading && tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+}
+
+async function runCommand(command) {
+  try {
+    await chrome.downloads[command.type](command.id);
+  } catch (error) {
+    console.warn("Mac Dock:", command, error);
+  }
+  sendDownloads();
+}
+
+function scheduleRetry() {
+  if (retryTimer) {
+    return;
+  }
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connect();
+  }, retryDelay);
+  retryDelay = nextDelay(retryDelay);
+}
+
+function connect() {
+  if (socket && (socket.readyState === WebSocket.OPEN ||
+                 socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  try {
+    socket = new WebSocket(`ws://127.0.0.1:${PORT}`);
+  } catch {
+    scheduleRetry();
+    return;
+  }
+  socket.onopen = () => {
+    retryDelay = 5000;
+    send({ type: "hello", browser: browserName, version: 1 });
+    sendDownloads();
+    clearInterval(pingTimer);
+    // (Also keeps Chrome's service worker awake; in Zen, an event of the
+    // extension's own every 20 s keeps its background page from idling.)
+    pingTimer = setInterval(() => {
+      send({ type: "ping" });
+      chrome.storage?.session?.set({ alive: Date.now() }).catch(() => {});
+    }, 20000);
+  };
+  socket.onmessage = (event) => {
+    const command = parseCommand(event.data);
+    if (command) {
+      runCommand(command);
+    }
+  };
+  socket.onclose = () => {
+    clearInterval(pingTimer);
+    pingTimer = null;
+    socket = null;
+    scheduleRetry();
+  };
+  socket.onerror = () => {};
+}
+
+chrome.downloads.onCreated.addListener(sendDownloads);
+chrome.downloads.onChanged.addListener(sendDownloads);
+chrome.downloads.onErased.addListener(sendDownloads);
+// (The keep-alive's event: nothing to do, receiving it is the point.)
+chrome.storage?.onChanged?.addListener(() => {});
+// Wakes the extension now and then, in case the dock came back.
+chrome.alarms.create("mac-dock-reconnect", { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(connect);
+chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onInstalled.addListener(connect);
+connect();
+)MDX";
+
+std::wstring MacDockDataPath(PCWSTR child) {
+    WCHAR base[MAX_PATH];
+    if (!ExpandEnvironmentStrings(L"%LOCALAPPDATA%\\MacDock", base,
+                                  ARRAYSIZE(base))) {
+        return L"";
+    }
+    std::wstring path = base;
+    if (child && *child) {
+        path += L"\\";
+        path += child;
+    }
+    return path;
+}
+
+bool WriteTextFile(const std::wstring& path, const char* text) {
+    HANDLE file = CreateFile(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    const DWORD size = (DWORD)strlen(text);
+    const bool ok = WriteFile(file, text, size, &written, nullptr) &&
+                    written == size;
+    CloseHandle(file);
+    return ok;
+}
+
+// Writes the extension to %LOCALAPPDATA%\MacDock\extensao; its folder, or
+// empty if it couldn't.
+std::wstring WriteExtensionFolder() {
+    const std::wstring folder = MacDockDataPath(L"extensao");
+    if (folder.empty()) {
+        return L"";
+    }
+    SHCreateDirectoryEx(nullptr, folder.c_str(), nullptr);
+    if (!WriteTextFile(folder + L"\\manifest.json", kExtensionManifest) ||
+        !WriteTextFile(folder + L"\\protocol.js", kExtensionProtocol) ||
+        !WriteTextFile(folder + L"\\background.js", kExtensionBackground)) {
+        return L"";
+    }
+    return folder;
+}
+
+// A program's path from "App Paths" (where Chrome and Zen register).
+std::wstring AppPath(PCWSTR exe) {
+    const std::wstring key =
+        std::wstring(L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\") +
+        exe;
+    for (HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}) {
+        WCHAR value[MAX_PATH];
+        DWORD size = sizeof(value);
+        if (RegGetValue(root, key.c_str(), nullptr, RRF_RT_REG_SZ, nullptr,
+                        value, &size) == ERROR_SUCCESS) {
+            return value;
+        }
+    }
+    return L"";
+}
+
+void CopyToClipboard(const std::wstring& text) {
+    if (!OpenClipboard(g_downloadsWnd)) {
+        return;
+    }
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(WCHAR);
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* target = GlobalLock(memory)) {
+            memcpy(target, text.c_str(), bytes);
+            GlobalUnlock(memory);
+            if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+                GlobalFree(memory);
+            }
+        } else {
+            GlobalFree(memory);
+        }
+    }
+    CloseClipboard();
+}
+
+// The "Instalar no Chrome" / "Instalar no Zen" buttons (the panel's thread).
+void InstallExtension(bool zen) {
+    const std::wstring folder = WriteExtensionFolder();
+    if (folder.empty()) {
+        MessageBox(nullptr,
+                   L"Não consegui gravar a extensão em "
+                   L"%LOCALAPPDATA%\\MacDock\\extensao.",
+                   L"Mac Dock", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        return;
+    }
+    if (!zen) {
+        CopyToClipboard(folder);
+        const std::wstring chrome = AppPath(L"chrome.exe");
+        ShellExecute(nullptr, L"open",
+                     chrome.empty() ? L"chrome.exe" : chrome.c_str(),
+                     L"chrome://extensions", nullptr, SW_SHOWNORMAL);
+        const std::wstring text =
+            L"A página de extensões do Chrome foi aberta e o caminho "
+            L"da extensão já está copiado.\n\n"
+            L"1. Ligue \"Modo do desenvolvedor\" (canto superior direito).\n"
+            L"2. Clique em \"Carregar sem compactação\".\n"
+            L"3. Cole o caminho (Ctrl+V) e confirme:\n\n" +
+            folder;
+        MessageBox(nullptr, text.c_str(), L"Mac Dock: extensão no Chrome",
+                   MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+        return;
+    }
+    const std::wstring xpi = MacDockDataPath(L"mac-dock-downloads.xpi");
+    if (GetFileAttributes(xpi.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const std::wstring zenExe = AppPath(L"zen.exe");
+        const std::wstring args = L"\"" + xpi + L"\"";
+        ShellExecute(nullptr, L"open",
+                     zenExe.empty() ? L"zen.exe" : zenExe.c_str(),
+                     args.c_str(), nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    const std::wstring dataFolder = MacDockDataPath(nullptr);
+    ShellExecute(nullptr, L"open", dataFolder.c_str(), nullptr, nullptr,
+                 SW_SHOWNORMAL);
+    const std::wstring text =
+        L"O Zen só instala extensões assinadas pela Mozilla.\n\n"
+        L"1. Assine o arquivo dist\\mac-dock-downloads.zip do repositório "
+        L"em addons.mozilla.org (\"Por conta própria\", não listada).\n"
+        L"2. Salve o .xpi assinado nesta pasta com o nome "
+        L"mac-dock-downloads.xpi:\n" +
+        dataFolder +
+        L"\n3. Clique de novo em \"Instalar no Zen\".\n\n"
+        L"Para testar antes (some ao fechar o Zen): about:debugging → "
+        L"Este Zen → Carregar extensão temporária → "
+        L"manifest.json em:\n" +
+        folder;
+    MessageBox(nullptr, text.c_str(), L"Mac Dock: extensão no Zen",
+               MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
 }
 
 LRESULT CALLBACK DownloadsWndProc(HWND hWnd,
@@ -10123,7 +10786,26 @@ LRESULT CALLBACK DownloadsWndProc(HWND hWnd,
         case WM_RBUTTONUP: {
             const int hit =
                 DownloadsHitTest({(short)LOWORD(lParam), (short)HIWORD(lParam)});
-            if (hit == -3 || hit == -4) {
+            if (hit == -5 || hit == -6) {
+                HideDownloadsPanel();
+                InstallExtension(hit == -6);
+            } else if (hit <= -100) {
+                const int index = (-100 - hit) / 2;
+                const bool cancel = (-100 - hit) % 2 == 1;
+                if (msg == WM_LBUTTONUP &&
+                    index < (int)g_downloadItems.size()) {
+                    const DownloadItem& item = g_downloadItems[index];
+                    if (cancel) {
+                        g_downloadsCancelledAt = NowSeconds();
+                        BridgeSend(item.bridgeClient, L"cancel", item.bridgeId);
+                    } else if (item.paused) {
+                        BridgeSend(item.bridgeClient, L"resume",
+                                   item.bridgeId);
+                    } else {
+                        BridgeSend(item.bridgeClient, L"pause", item.bridgeId);
+                    }
+                }
+            } else if (hit == -3 || hit == -4) {
                 const int view = hit == -3 ? 0 : 1;
                 if (view != DownloadsView()) {
                     g_downloadsView = view;
@@ -10191,6 +10873,599 @@ void ShowDownloadsPanel(int x, int y) {
     InvalidateRect(g_downloadsWnd, nullptr, FALSE);
 }
 
+// The browser bridge (dock.browserBridge): the "Mac Dock Downloads"
+// extension in Chrome or Zen connects here, on 127.0.0.1:27821, over a
+// WebSocket. It sends what's downloading; the dock sends pause, resume and
+// cancel. Only browser extensions' origins are let in. A thread of its own
+// waits on its sockets (no polling).
+
+// BRIDGE-CORE-BEGIN
+// The WebSocket pieces (RFC 6455), kept apart from the rest of the mod so
+// tools/test-bridge-core.ps1 tests them on their own.
+std::string Base64Encode(const unsigned char* data, size_t size) {
+    static const char kAlphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    for (size_t i = 0; i < size; i += 3) {
+        const unsigned value = (data[i] << 16) |
+                               (i + 1 < size ? data[i + 1] << 8 : 0) |
+                               (i + 2 < size ? data[i + 2] : 0);
+        out.push_back(kAlphabet[(value >> 18) & 63]);
+        out.push_back(kAlphabet[(value >> 12) & 63]);
+        out.push_back(i + 1 < size ? kAlphabet[(value >> 6) & 63] : '=');
+        out.push_back(i + 2 < size ? kAlphabet[value & 63] : '=');
+    }
+    return out;
+}
+
+// The handshake's answer to the client's Sec-WebSocket-Key.
+std::string WsAcceptKey(const std::string& key) {
+    const std::string input = key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    unsigned char hash[20] = {};
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA1_ALGORITHM, nullptr,
+                                    0) != 0) {
+        return "";
+    }
+    BCRYPT_HASH_HANDLE hasher = nullptr;
+    bool ok = BCryptCreateHash(algorithm, &hasher, nullptr, 0, nullptr, 0,
+                               0) == 0;
+    ok = ok && BCryptHashData(hasher, (PUCHAR)input.data(),
+                              (ULONG)input.size(), 0) == 0;
+    ok = ok && BCryptFinishHash(hasher, hash, sizeof(hash), 0) == 0;
+    if (hasher) {
+        BCryptDestroyHash(hasher);
+    }
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    return ok ? Base64Encode(hash, sizeof(hash)) : "";
+}
+
+// A header's value in an HTTP request (its name in any case), trimmed.
+std::string HttpHeaderValue(const std::string& request, const char* name) {
+    const size_t nameLength = strlen(name);
+    size_t line = request.find("\r\n");
+    while (line != std::string::npos) {
+        line += 2;
+        const size_t end = request.find("\r\n", line);
+        if (end == std::string::npos || end == line) {
+            break;
+        }
+        const size_t colon = request.find(':', line);
+        if (colon != std::string::npos && colon < end &&
+            colon - line == nameLength &&
+            _strnicmp(request.c_str() + line, name, nameLength) == 0) {
+            size_t first = colon + 1;
+            size_t last = end;
+            while (first < last &&
+                   (request[first] == ' ' || request[first] == '\t')) {
+                first++;
+            }
+            while (last > first &&
+                   (request[last - 1] == ' ' || request[last - 1] == '\t')) {
+                last--;
+            }
+            return request.substr(first, last - first);
+        }
+        line = end;
+    }
+    return "";
+}
+
+// Only browser extensions may connect (a web page's origin is never one).
+bool BridgeOriginAllowed(const std::string& origin) {
+    for (const char* prefix : {"chrome-extension://", "moz-extension://"}) {
+        const size_t length = strlen(prefix);
+        if (origin.size() > length && origin.compare(0, length, prefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class WsResult { NeedMore, Message, Error };
+
+struct WsMessage {
+    int opcode = 0;
+    std::string payload;
+};
+
+// (A browser's whole download list fits well within this.)
+constexpr size_t kWsMaxMessage = 1 << 20;
+
+// Reads a client's frames as they arrive: whole messages out (fragments put
+// together, control frames as they come).
+struct WsReader {
+    std::string buffer;
+    std::string fragments;
+    int fragmentOpcode = 0;
+
+    void Feed(const std::string& data) { buffer += data; }
+
+    WsResult Next(WsMessage* out) {
+        for (;;) {
+            if (buffer.size() < 2) {
+                return WsResult::NeedMore;
+            }
+            const unsigned char first = (unsigned char)buffer[0];
+            const unsigned char second = (unsigned char)buffer[1];
+            const bool fin = first & 0x80;
+            const int opcode = first & 0x0F;
+            // (No extensions agreed on; clients always mask.)
+            if ((first & 0x70) || !(second & 0x80)) {
+                return WsResult::Error;
+            }
+            unsigned long long length = second & 0x7F;
+            size_t header = 2;
+            if (length == 126) {
+                if (buffer.size() < 4) {
+                    return WsResult::NeedMore;
+                }
+                length = ((unsigned char)buffer[2] << 8) |
+                         (unsigned char)buffer[3];
+                header = 4;
+            } else if (length == 127) {
+                if (buffer.size() < 10) {
+                    return WsResult::NeedMore;
+                }
+                length = 0;
+                for (int i = 2; i < 10; i++) {
+                    length = (length << 8) | (unsigned char)buffer[i];
+                }
+                header = 10;
+            }
+            if (length > kWsMaxMessage ||
+                (opcode >= 8 && (!fin || length > 125))) {
+                return WsResult::Error;
+            }
+            if (buffer.size() < header + 4 + length) {
+                return WsResult::NeedMore;
+            }
+            const unsigned char* mask =
+                (const unsigned char*)buffer.data() + header;
+            std::string payload((size_t)length, '\0');
+            for (size_t i = 0; i < (size_t)length; i++) {
+                payload[i] = (char)(buffer[header + 4 + i] ^ mask[i % 4]);
+            }
+            buffer.erase(0, header + 4 + (size_t)length);
+            if (opcode >= 8) {
+                out->opcode = opcode;
+                out->payload = std::move(payload);
+                return WsResult::Message;
+            }
+            if (opcode == 0) {
+                if (!fragmentOpcode) {
+                    return WsResult::Error;
+                }
+                fragments += payload;
+            } else if (opcode == 1 || opcode == 2) {
+                if (fragmentOpcode) {
+                    return WsResult::Error;
+                }
+                fragmentOpcode = opcode;
+                fragments = std::move(payload);
+            } else {
+                return WsResult::Error;
+            }
+            if (fragments.size() > kWsMaxMessage) {
+                return WsResult::Error;
+            }
+            if (fin) {
+                out->opcode = fragmentOpcode;
+                out->payload = std::move(fragments);
+                fragments.clear();
+                fragmentOpcode = 0;
+                return WsResult::Message;
+            }
+        }
+    }
+};
+
+// A frame from the dock (servers don't mask).
+std::string WsEncode(int opcode, const std::string& payload) {
+    std::string out;
+    out.push_back((char)(0x80 | opcode));
+    const size_t size = payload.size();
+    if (size < 126) {
+        out.push_back((char)size);
+    } else if (size < 65536) {
+        out.push_back((char)126);
+        out.push_back((char)(size >> 8));
+        out.push_back((char)(size & 0xFF));
+    } else {
+        out.push_back((char)127);
+        for (int shift = 56; shift >= 0; shift -= 8) {
+            out.push_back((char)(((unsigned long long)size >> shift) & 0xFF));
+        }
+    }
+    return out + payload;
+}
+// BRIDGE-CORE-END
+
+// (Below 32768: WSL's mirrored networking quietly reserves Linux's
+// ephemeral ports, 32768 to 60999, on Windows too, and they don't show in
+// netstat; Windows' own dynamic ports start at 49152.)
+constexpr USHORT kBridgePort = 27821;
+constexpr int kBridgeMaxClients = 4;
+
+struct BridgeClient {
+    SOCKET socket = INVALID_SOCKET;
+    WSAEVENT event = WSA_INVALID_EVENT;
+    int key = 0;
+    bool open = false;
+    bool closing = false;
+    std::string request;
+    WsReader reader;
+    std::string out;
+};
+
+// Guards the three below (shared with the panel's and the dock's threads).
+SRWLOCK g_bridgeLock = SRWLOCK_INIT;
+[[clang::no_destroy]] std::vector<BridgeItem> g_bridgeItems;
+[[clang::no_destroy]] std::vector<std::pair<int, std::wstring>>
+    g_bridgeBrowsers;
+[[clang::no_destroy]] std::vector<std::pair<int, std::string>> g_bridgeOutbox;
+HANDLE g_bridgeThread;
+// Set to send what's in the outbox, or to stop.
+HANDLE g_bridgeWake;
+std::atomic<bool> g_bridgeStop{false};
+
+std::vector<BridgeItem> BridgeSnapshot() {
+    AcquireSRWLockShared(&g_bridgeLock);
+    std::vector<BridgeItem> items = g_bridgeItems;
+    ReleaseSRWLockShared(&g_bridgeLock);
+    return items;
+}
+
+bool BridgeConnected(PCWSTR browser) {
+    bool connected = false;
+    AcquireSRWLockShared(&g_bridgeLock);
+    for (const auto& [key, name] : g_bridgeBrowsers) {
+        if (name == browser) {
+            connected = true;
+        }
+    }
+    ReleaseSRWLockShared(&g_bridgeLock);
+    return connected;
+}
+
+// Asks the browser of `client` to pause, resume or cancel download `id`.
+void BridgeSend(int client, PCWSTR type, long long id) {
+    char text[96];
+    sprintf_s(text, "{\"type\":\"%ls\",\"id\":%lld}", type, id);
+    AcquireSRWLockExclusive(&g_bridgeLock);
+    g_bridgeOutbox.push_back({client, text});
+    ReleaseSRWLockExclusive(&g_bridgeLock);
+    if (g_bridgeWake) {
+        SetEvent(g_bridgeWake);
+    }
+}
+
+void BridgeNotify() {
+    PokeDockRendering();
+    if (g_downloadsThreadId) {
+        PostThreadMessage(g_downloadsThreadId, kBridgeChanged, 0, 0);
+    }
+}
+
+void BridgeForget(int key) {
+    AcquireSRWLockExclusive(&g_bridgeLock);
+    std::erase_if(g_bridgeItems,
+                  [key](const BridgeItem& item) { return item.client == key; });
+    std::erase_if(g_bridgeBrowsers,
+                  [key](const auto& entry) { return entry.first == key; });
+    ReleaseSRWLockExclusive(&g_bridgeLock);
+    BridgeNotify();
+}
+
+void BridgeHandleMessageUnsafe(BridgeClient& client, const std::string& text);
+
+// (C++/WinRT's GetNamed* throw when a field is there with another type: a
+// bad message is ignored, never a crash of Explorer.)
+void BridgeHandleMessage(BridgeClient& client, const std::string& text) {
+    try {
+        BridgeHandleMessageUnsafe(client, text);
+    } catch (...) {
+        IslandLog(L"Browser bridge: a message was ignored");
+    }
+}
+
+void BridgeHandleMessageUnsafe(BridgeClient& client, const std::string& text) {
+    using namespace winrt::Windows::Data::Json;
+    JsonObject message{nullptr};
+    if (!JsonObject::TryParse(winrt::to_hstring(text), message)) {
+        return;
+    }
+    const std::wstring type(message.GetNamedString(L"type", L""));
+    if (type == L"hello") {
+        const std::wstring browser(message.GetNamedString(L"browser", L""));
+        AcquireSRWLockExclusive(&g_bridgeLock);
+        std::erase_if(g_bridgeBrowsers, [&](const auto& entry) {
+            return entry.first == client.key;
+        });
+        g_bridgeBrowsers.push_back({client.key, browser});
+        ReleaseSRWLockExclusive(&g_bridgeLock);
+        IslandLog(L"Browser bridge: %s connected", browser.c_str());
+        BridgeNotify();
+    } else if (type == L"downloads") {
+        std::vector<BridgeItem> items;
+        const JsonArray list = message.GetNamedArray(L"items", JsonArray());
+        for (const auto& value : list) {
+            if (value.ValueType() != JsonValueType::Object) {
+                continue;
+            }
+            const JsonObject entry = value.GetObject();
+            BridgeItem item;
+            item.client = client.key;
+            item.id = (long long)entry.GetNamedNumber(L"id", 0);
+            item.path = entry.GetNamedString(L"path", L"");
+            item.name = entry.GetNamedString(L"name", L"");
+            item.bytes = (ULONGLONG)std::max(0.0, entry.GetNamedNumber(L"bytes", 0));
+            item.total = (ULONGLONG)std::max(0.0, entry.GetNamedNumber(L"total", 0));
+            item.paused = entry.GetNamedBoolean(L"paused", false);
+            item.canResume = entry.GetNamedBoolean(L"canResume", false);
+            item.interrupted =
+                entry.GetNamedString(L"state", L"") == L"interrupted";
+            if (!item.name.empty()) {
+                items.push_back(std::move(item));
+            }
+        }
+        AcquireSRWLockExclusive(&g_bridgeLock);
+        std::erase_if(g_bridgeItems, [&](const BridgeItem& item) {
+            return item.client == client.key;
+        });
+        g_bridgeItems.insert(g_bridgeItems.end(), items.begin(), items.end());
+        ReleaseSRWLockExclusive(&g_bridgeLock);
+        BridgeNotify();
+    }
+}
+
+// Sends what's waiting for `client`; false if its connection broke.
+bool BridgeFlush(BridgeClient& client) {
+    while (!client.out.empty()) {
+        const int sent = send(client.socket, client.out.data(),
+                              (int)std::min<size_t>(client.out.size(), 65536),
+                              0);
+        if (sent == SOCKET_ERROR) {
+            return WSAGetLastError() == WSAEWOULDBLOCK;
+        }
+        client.out.erase(0, sent);
+    }
+    return true;
+}
+
+// Reads what `client` sent; false once it should be dropped.
+bool BridgeRead(BridgeClient& client) {
+    char chunk[8192];
+    for (;;) {
+        const int got = recv(client.socket, chunk, sizeof(chunk), 0);
+        if (got == 0) {
+            return false;
+        }
+        if (got == SOCKET_ERROR) {
+            if (WSAGetLastError() == WSAEWOULDBLOCK) {
+                break;
+            }
+            return false;
+        }
+        if (!client.open) {
+            client.request.append(chunk, got);
+            const size_t end = client.request.find("\r\n\r\n");
+            if (end == std::string::npos) {
+                if (client.request.size() > 8192) {
+                    return false;
+                }
+                continue;
+            }
+            const std::string key =
+                HttpHeaderValue(client.request, "Sec-WebSocket-Key");
+            const std::string origin = HttpHeaderValue(client.request, "Origin");
+            if (key.empty() || !BridgeOriginAllowed(origin)) {
+                client.out =
+                    "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n"
+                    "Connection: close\r\n\r\n";
+                BridgeFlush(client);
+                return false;
+            }
+            client.out +=
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                "Connection: Upgrade\r\nSec-WebSocket-Accept: " +
+                WsAcceptKey(key) + "\r\n\r\n";
+            client.open = true;
+            client.reader.Feed(client.request.substr(end + 4));
+            client.request.clear();
+        } else {
+            client.reader.Feed(std::string(chunk, got));
+        }
+    }
+    if (!client.open) {
+        return true;
+    }
+    WsMessage message;
+    for (;;) {
+        const WsResult result = client.reader.Next(&message);
+        if (result == WsResult::NeedMore) {
+            break;
+        }
+        if (result == WsResult::Error) {
+            return false;
+        }
+        if (message.opcode == 1) {
+            BridgeHandleMessage(client, message.payload);
+        } else if (message.opcode == 9) {
+            client.out += WsEncode(10, message.payload);
+        } else if (message.opcode == 8) {
+            client.out += WsEncode(8, "");
+            client.closing = true;
+        }
+    }
+    return true;
+}
+
+void BridgeDrop(std::vector<BridgeClient>& clients, size_t index) {
+    BridgeClient& client = clients[index];
+    const bool known = client.open;
+    closesocket(client.socket);
+    WSACloseEvent(client.event);
+    const int key = client.key;
+    clients.erase(clients.begin() + index);
+    if (known) {
+        BridgeForget(key);
+    }
+}
+
+DWORD WINAPI BridgeThreadProc(LPVOID) {
+    winrt::init_apartment(winrt::apartment_type::multi_threaded);
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+        winrt::uninit_apartment();
+        return 0;
+    }
+    SOCKET listener = INVALID_SOCKET;
+    WSAEVENT listenEvent = WSACreateEvent();
+    std::vector<BridgeClient> clients;
+    int nextKey = 1;
+    while (!g_bridgeStop) {
+        if (listener == INVALID_SOCKET) {
+            listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+            BOOL exclusive = TRUE;
+            setsockopt(listener, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                       (const char*)&exclusive, sizeof(exclusive));
+            sockaddr_in address{};
+            address.sin_family = AF_INET;
+            address.sin_port = htons(kBridgePort);
+            address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (listener == INVALID_SOCKET ||
+                bind(listener, (sockaddr*)&address, sizeof(address)) != 0 ||
+                listen(listener, kBridgeMaxClients) != 0 ||
+                WSAEventSelect(listener, listenEvent, FD_ACCEPT) != 0) {
+                // (The port taken, by an Explorer still closing: again in a
+                // while.)
+                IslandLog(L"Browser bridge: can't listen (%d)",
+                          WSAGetLastError());
+                if (listener != INVALID_SOCKET) {
+                    closesocket(listener);
+                    listener = INVALID_SOCKET;
+                }
+                WaitForSingleObject(g_bridgeWake, 10000);
+                continue;
+            }
+        }
+        HANDLE handles[2 + kBridgeMaxClients];
+        DWORD count = 0;
+        handles[count++] = g_bridgeWake;
+        handles[count++] = listenEvent;
+        for (const auto& client : clients) {
+            handles[count++] = client.event;
+        }
+        WaitForMultipleObjects(count, handles, FALSE, INFINITE);
+        if (g_bridgeStop) {
+            break;
+        }
+
+        WSANETWORKEVENTS events{};
+        if (WSAEnumNetworkEvents(listener, listenEvent, &events) == 0 &&
+            (events.lNetworkEvents & FD_ACCEPT)) {
+            for (;;) {
+                SOCKET accepted = accept(listener, nullptr, nullptr);
+                if (accepted == INVALID_SOCKET) {
+                    break;
+                }
+                if ((int)clients.size() >= kBridgeMaxClients) {
+                    closesocket(accepted);
+                    continue;
+                }
+                BridgeClient client;
+                client.socket = accepted;
+                client.event = WSACreateEvent();
+                client.key = nextKey++;
+                WSAEventSelect(accepted, client.event,
+                               FD_READ | FD_WRITE | FD_CLOSE);
+                clients.push_back(std::move(client));
+            }
+        }
+
+        // What the dock asked to send.
+        std::vector<std::pair<int, std::string>> outbox;
+        AcquireSRWLockExclusive(&g_bridgeLock);
+        outbox.swap(g_bridgeOutbox);
+        ReleaseSRWLockExclusive(&g_bridgeLock);
+        for (const auto& [key, text] : outbox) {
+            for (auto& client : clients) {
+                if (client.key == key && client.open) {
+                    client.out += WsEncode(1, text);
+                }
+            }
+        }
+
+        for (size_t i = clients.size(); i-- > 0;) {
+            BridgeClient& client = clients[i];
+            WSANETWORKEVENTS clientEvents{};
+            WSAEnumNetworkEvents(client.socket, client.event, &clientEvents);
+            bool keep = true;
+            if (clientEvents.lNetworkEvents & (FD_READ | FD_CLOSE)) {
+                keep = BridgeRead(client);
+            }
+            if (keep) {
+                keep = BridgeFlush(client);
+            }
+            if (keep && (clientEvents.lNetworkEvents & FD_CLOSE)) {
+                keep = false;
+            }
+            if (keep && client.closing && client.out.empty()) {
+                keep = false;
+            }
+            if (!keep) {
+                BridgeDrop(clients, i);
+            }
+        }
+    }
+    while (!clients.empty()) {
+        BridgeDrop(clients, clients.size() - 1);
+    }
+    if (listener != INVALID_SOCKET) {
+        closesocket(listener);
+    }
+    WSACloseEvent(listenEvent);
+    WSACleanup();
+    winrt::uninit_apartment();
+    return 0;
+}
+
+void StartBridge() {
+    if (g_bridgeThread) {
+        return;
+    }
+    g_bridgeStop = false;
+    g_bridgeWake = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (!g_bridgeWake) {
+        return;
+    }
+    g_bridgeThread =
+        CreateThread(nullptr, 0, BridgeThreadProc, nullptr, 0, nullptr);
+    if (!g_bridgeThread) {
+        CloseHandle(g_bridgeWake);
+        g_bridgeWake = nullptr;
+    }
+}
+
+void StopBridge() {
+    if (!g_bridgeThread) {
+        return;
+    }
+    g_bridgeStop = true;
+    SetEvent(g_bridgeWake);
+    WaitForSingleObject(g_bridgeThread, 5000);
+    CloseHandle(g_bridgeThread);
+    g_bridgeThread = nullptr;
+    CloseHandle(g_bridgeWake);
+    g_bridgeWake = nullptr;
+    AcquireSRWLockExclusive(&g_bridgeLock);
+    g_bridgeItems.clear();
+    g_bridgeBrowsers.clear();
+    g_bridgeOutbox.clear();
+    ReleaseSRWLockExclusive(&g_bridgeLock);
+}
+
 DWORD WINAPI DownloadsThreadProc(LPVOID started) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     MSG msg;
@@ -10244,6 +11519,10 @@ DWORD WINAPI DownloadsThreadProc(LPVOID started) {
                 quit = true;
                 break;
             }
+            if (!msg.hwnd && msg.message == kBridgeChanged) {
+                ScanDownloads();
+                continue;
+            }
             if (!msg.hwnd && msg.message == kDownloadsToggle) {
                 if (g_downloadsWnd && IsWindowVisible(g_downloadsWnd)) {
                     HideDownloadsPanel();
@@ -10285,6 +11564,11 @@ DWORD WINAPI DownloadsThreadProc(LPVOID started) {
 }
 
 void StartDownloads() {
+    if (g_settings.dockBrowserBridge) {
+        StartBridge();
+    } else {
+        StopBridge();
+    }
     if (g_downloadsThread) {
         return;
     }
@@ -10303,6 +11587,7 @@ void StartDownloads() {
 }
 
 void StopDownloads() {
+    StopBridge();
     if (!g_downloadsThread) {
         return;
     }
@@ -14268,6 +15553,8 @@ void LoadSettings() {
     g_settings.dockIslandStyle = Wh_GetIntSetting(L"dock.islandStyle") != 0;
     g_settings.dockPinButton = Wh_GetIntSetting(L"dock.pinButton") != 0;
     g_settings.dockDownloads = Wh_GetIntSetting(L"dock.downloads") != 0;
+    g_settings.dockBrowserBridge =
+        Wh_GetIntSetting(L"dock.browserBridge") != 0;
     if (g_settings.dockIslandStyle) {
         g_settings.bottomGap = 0;
     }
