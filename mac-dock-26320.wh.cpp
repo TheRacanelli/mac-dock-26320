@@ -4,7 +4,7 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock12
+// @version         3.1.0-dock13
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
@@ -9568,7 +9568,42 @@ void MergeBridgeDownloads(std::vector<DownloadItem>& found) {
     }
     FILETIME now{};
     GetSystemTimeAsFileTime(&now);
-    for (const auto& entry : bridge) {
+    // Unfinished files no browser's download claimed by name yet (Chrome's
+    // "Unconfirmed 123456.crdownload" doesn't carry the final name).
+    auto unclaimedPartial = [&](const BridgeItem& entry) {
+        const std::wstring folder =
+            entry.path.substr(0, entry.path.find_last_of(L"\\/") + 1);
+        auto best = found.end();
+        ULONGLONG bestGap = 0;
+        for (auto it = found.begin(); it != found.end(); ++it) {
+            if (!it->partial || it->bridgeClient >= 0 ||
+                _wcsnicmp(it->path.c_str(), folder.c_str(), folder.size()) !=
+                    0 ||
+                it->path.find_first_of(L"\\/", folder.size()) !=
+                    std::wstring::npos) {
+                continue;
+            }
+            const ULONGLONG gap = it->size > entry.bytes
+                                      ? it->size - entry.bytes
+                                      : entry.bytes - it->size;
+            if (best == found.end() || gap < bestGap) {
+                best = it;
+                bestGap = gap;
+            }
+        }
+        // (Sizes a little apart: the file and the browser's count aren't
+        // read at the same moment.)
+        const ULONGLONG slack =
+            std::max<ULONGLONG>(64ull * 1024 * 1024, entry.bytes / 4);
+        return best != found.end() && bestGap <= slack ? best : found.end();
+    };
+    std::vector<bool> matched(bridge.size(), false);
+    for (int pass = 0; pass < 2; pass++) {
+    for (size_t index = 0; index < bridge.size(); index++) {
+        const BridgeItem& entry = bridge[index];
+        if (matched[index]) {
+            continue;
+        }
         DownloadItem item;
         item.path = entry.path;
         item.name = entry.name;
@@ -9580,24 +9615,39 @@ void MergeBridgeDownloads(std::vector<DownloadItem>& found) {
         item.canResume = entry.canResume;
         item.bridgeClient = entry.client;
         item.bridgeId = entry.id;
-        for (auto it = found.begin(); it != found.end(); ++it) {
-            if (!it->partial || it->bridgeClient >= 0) {
-                continue;
-            }
-            std::wstring finalPath = it->path;
-            for (PCWSTR suffix : {L".crdownload", L".part"}) {
-                if (EndsWithI(finalPath, suffix)) {
-                    finalPath.resize(finalPath.size() - wcslen(suffix));
+        // First by name (all of them), then by size (what's left), so a
+        // download whose file has its name never loses it to another.
+        auto file = found.end();
+        if (pass == 0) {
+            for (auto it = found.begin(); it != found.end(); ++it) {
+                if (!it->partial || it->bridgeClient >= 0) {
+                    continue;
+                }
+                std::wstring finalPath = it->path;
+                for (PCWSTR suffix : {L".crdownload", L".part"}) {
+                    if (EndsWithI(finalPath, suffix)) {
+                        finalPath.resize(finalPath.size() - wcslen(suffix));
+                    }
+                }
+                if (_wcsicmp(finalPath.c_str(), entry.path.c_str()) == 0) {
+                    file = it;
+                    break;
                 }
             }
-            if (_wcsicmp(finalPath.c_str(), entry.path.c_str()) == 0) {
-                // (Shown in its folder: the file that's there.)
-                item.path = it->path;
-                found.erase(it);
-                break;
+            if (file == found.end()) {
+                continue;
             }
+        } else {
+            file = unclaimedPartial(entry);
         }
+        if (file != found.end()) {
+            // (Shown in its folder: the file that's there.)
+            item.path = file->path;
+            found.erase(file);
+        }
+        matched[index] = true;
         found.push_back(std::move(item));
+    }
     }
 }
 
