@@ -4,7 +4,7 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock10
+// @version         3.1.0-dock11
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
@@ -9440,6 +9440,8 @@ constexpr int kDlListWidth = 440;
 constexpr int kDlRowHeight = 52;
 constexpr int kDlListThumb = 34;
 constexpr int kDlButton = 30;
+// The footer with the browsers' extension (dock.browserBridge).
+constexpr int kDlFooter = 42;
 
 struct DownloadItem {
     std::wstring path;
@@ -9809,6 +9811,21 @@ RECT DownloadsFolderLinkRect() {
             client.right - DlPx(kDlPad), DlPx(kDlPad + 28)};
 }
 
+bool DownloadsFooterShown() {
+    return g_settings.dockBrowserBridge;
+}
+
+// The footer's halves: Chrome (0) and Zen (1), connected or to install.
+RECT DownloadsFooterRect(int which) {
+    RECT client{};
+    GetClientRect(g_downloadsWnd, &client);
+    const int top = client.bottom - DlPx(kDlPad + 28);
+    const int left = DlPx(kDlPad);
+    const int half = (client.right - DlPx(kDlPad * 2)) / 2;
+    const int x = left + which * half;
+    return {x, top, x + half - (which == 0 ? DlPx(6) : 0), top + DlPx(28)};
+}
+
 // A browser's download's buttons: pause or resume (0) and cancel (1), in the
 // grid's tile's top right corner, at the list's row's right end.
 constexpr int kDlItemButton = 24;
@@ -9869,7 +9886,8 @@ void PlaceDownloadsPanel() {
     const int width = DlPx(kDlPad * 2 + (list ? kDlListWidth
                                               : kDownloadsColumns * kDlTileWidth));
     const int height = DlPx(kDlPad * 2 + kDlHeader +
-                            DownloadsRows() * (list ? kDlRowHeight : kDlTileHeight));
+                            DownloadsRows() * (list ? kDlRowHeight : kDlTileHeight) +
+                            (DownloadsFooterShown() ? kDlFooter : 0));
     const int margin = DlPx(10);
     int left = g_downloadsAnchor.x - width / 2;
     left = std::min(left, (int)info.rcMonitor.right - margin - width);
@@ -10075,7 +10093,8 @@ void PaintDownloads(HWND hWnd, HDC target) {
 
     if (g_downloadItems.empty()) {
         RECT empty{0, DlPx(kDlPad + kDlHeader), client.right,
-                   client.bottom - DlPx(kDlPad)};
+                   client.bottom - DlPx(kDlPad) -
+                       (DownloadsFooterShown() ? DlPx(kDlFooter) : 0)};
         SetTextColor(hdc, kGray);
         DrawText(hdc, L"Nenhum arquivo em Downloads", -1, &empty,
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
@@ -10254,6 +10273,34 @@ void PaintDownloads(HWND hWnd, HDC target) {
         drawButtons();
     }
 
+    // The extension: connected in each browser, or a button to install it.
+    if (DownloadsFooterShown()) {
+        const RECT chrome = DownloadsFooterRect(0);
+        const RECT line{DlPx(kDlPad), chrome.top - DlPx(8),
+                        client.right - DlPx(kDlPad), chrome.top - DlPx(7)};
+        HBRUSH lineBrush = CreateSolidBrush(RGB(40, 40, 40));
+        FillRect(hdc, &line, lineBrush);
+        DeleteObject(lineBrush);
+        SelectObject(hdc, g_dlSmallFont);
+        for (int which = 0; which < 2; which++) {
+            RECT box = DownloadsFooterRect(which);
+            const bool connected = BridgeConnected(which ? L"zen" : L"chrome");
+            const bool hovered = !connected && g_downloadsHover == -5 - which;
+            if (hovered) {
+                FillRounded(hdc, box, DlPx(10), kHover);
+            }
+            SetTextColor(hdc, connected ? RGB(0x5E, 0xD8, 0x7A)
+                              : hovered ? kWhite
+                                        : kBlue);
+            PCWSTR text = which ? (connected ? L"● Zen conectado"
+                                             : L"Instalar no Zen")
+                                : (connected ? L"● Chrome conectado"
+                                             : L"Instalar no Chrome");
+            DrawText(hdc, text, -1, &box,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        }
+    }
+
     SelectObject(hdc, oldFont);
     BitBlt(target, 0, 0, client.right, client.bottom, hdc, 0, 0, SRCCOPY);
     SelectObject(hdc, oldCanvas);
@@ -10262,9 +10309,19 @@ void PaintDownloads(HWND hWnd, HDC target) {
 }
 
 // What's at `pt`: a file's index, -2 for "Abrir pasta", -3 and -4 for the
-// grid and list buttons, -100 - 2 * index for a download's pause or resume
+// grid and list buttons, -5 and -6 for installing the extension in Chrome
+// and Zen, -100 - 2 * index for a download's pause or resume
 // and one less for its cancel, -1 for nothing.
 int DownloadsHitTest(POINT pt) {
+    if (DownloadsFooterShown()) {
+        for (int which = 0; which < 2; which++) {
+            const RECT box = DownloadsFooterRect(which);
+            if (PtInRect(&box, pt) &&
+                !BridgeConnected(which ? L"zen" : L"chrome")) {
+                return -5 - which;
+            }
+        }
+    }
     const RECT link = DownloadsFolderLinkRect();
     if (PtInRect(&link, pt)) {
         return -2;
@@ -10315,6 +10372,308 @@ void OpenInFolder(const std::wstring& path) {
                  SW_SHOWNORMAL);
 }
 
+// The browsers' extension ("Mac Dock Downloads"), the same as extension/ in
+// the mod's repository (tools/pack-extension.ps1 checks), written out by the
+// panel's "Instalar" buttons.
+// EXTENSION-FILE manifest.json
+constexpr char kExtensionManifest[] = R"MDX({
+  "manifest_version": 3,
+  "name": "Mac Dock Downloads",
+  "version": "1.0.0",
+  "description": "Shows the browser's downloads in the Mac Dock (Windhawk) and lets it pause, resume and cancel them.",
+  "permissions": ["downloads", "alarms"],
+  "background": {
+    "service_worker": "background.js",
+    "scripts": ["background.js"],
+    "type": "module"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "mac-dock-downloads@racanelli",
+      "strict_min_version": "121.0",
+      "data_collection_permissions": { "required": ["none"] }
+    }
+  }
+}
+)MDX";
+// EXTENSION-FILE protocol.js
+constexpr char kExtensionProtocol[] = R"MDX(// Mac Dock Downloads: what the extension and the dock say to each other.
+
+export const PORT = 47821;
+const COMMANDS = ["pause", "resume", "cancel"];
+
+// A browser download as the dock wants it.
+export function toItem(d) {
+  const path = d.filename || "";
+  const parts = path.split(/[\\/]/);
+  return {
+    id: d.id,
+    path,
+    name: parts[parts.length - 1] || "",
+    bytes: d.bytesReceived || 0,
+    total: d.totalBytes > 0 ? d.totalBytes : 0,
+    state: d.state,
+    paused: !!d.paused,
+    canResume: !!d.canResume,
+  };
+}
+
+// Downloading now, or stopped but able to go on.
+export function isActive(d) {
+  return d.state === "in_progress" || (d.state === "interrupted" && !!d.canResume);
+}
+
+// A command from the dock, or null for anything else.
+export function parseCommand(text) {
+  let message;
+  try {
+    message = JSON.parse(text);
+  } catch {
+    return null;
+  }
+  if (!message || !COMMANDS.includes(message.type) || typeof message.id !== "number") {
+    return null;
+  }
+  return { type: message.type, id: message.id };
+}
+
+// How long to wait before trying the dock again.
+export function nextDelay(previousMs) {
+  return Math.min(previousMs * 2, 60000);
+}
+)MDX";
+// EXTENSION-FILE background.js
+constexpr char kExtensionBackground[] = R"MDX(// Mac Dock Downloads: tells the dock (Windhawk mod, ws://127.0.0.1:47821)
+// what's downloading and does what it asks: pause, resume, cancel.
+import { PORT, toItem, isActive, parseCommand, nextDelay } from "./protocol.js";
+
+const browserName = navigator.userAgent.includes("Firefox") ? "zen" : "chrome";
+let socket = null;
+let retryDelay = 5000;
+let retryTimer = null;
+let tickTimer = null;
+let pingTimer = null;
+
+function send(message) {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify(message));
+  }
+}
+
+async function sendDownloads() {
+  const all = await chrome.downloads.search({ orderBy: ["-startTime"], limit: 50 });
+  const active = all.filter(isActive);
+  send({ type: "downloads", items: active.map(toItem) });
+  // Every second only while something is downloading.
+  const downloading = active.some((d) => d.state === "in_progress" && !d.paused);
+  if (downloading && !tickTimer) {
+    tickTimer = setInterval(sendDownloads, 1000);
+  } else if (!downloading && tickTimer) {
+    clearInterval(tickTimer);
+    tickTimer = null;
+  }
+}
+
+async function runCommand(command) {
+  try {
+    await chrome.downloads[command.type](command.id);
+  } catch (error) {
+    console.warn("Mac Dock:", command, error);
+  }
+  sendDownloads();
+}
+
+function scheduleRetry() {
+  if (retryTimer) {
+    return;
+  }
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    connect();
+  }, retryDelay);
+  retryDelay = nextDelay(retryDelay);
+}
+
+function connect() {
+  if (socket && (socket.readyState === WebSocket.OPEN ||
+                 socket.readyState === WebSocket.CONNECTING)) {
+    return;
+  }
+  try {
+    socket = new WebSocket(`ws://127.0.0.1:${PORT}`);
+  } catch {
+    scheduleRetry();
+    return;
+  }
+  socket.onopen = () => {
+    retryDelay = 5000;
+    send({ type: "hello", browser: browserName, version: 1 });
+    sendDownloads();
+    clearInterval(pingTimer);
+    // (Also keeps Chrome's service worker awake.)
+    pingTimer = setInterval(() => send({ type: "ping" }), 20000);
+  };
+  socket.onmessage = (event) => {
+    const command = parseCommand(event.data);
+    if (command) {
+      runCommand(command);
+    }
+  };
+  socket.onclose = () => {
+    clearInterval(pingTimer);
+    pingTimer = null;
+    socket = null;
+    scheduleRetry();
+  };
+  socket.onerror = () => {};
+}
+
+chrome.downloads.onCreated.addListener(sendDownloads);
+chrome.downloads.onChanged.addListener(sendDownloads);
+chrome.downloads.onErased.addListener(sendDownloads);
+// Wakes the extension now and then, in case the dock came back.
+chrome.alarms.create("mac-dock-reconnect", { periodInMinutes: 1 });
+chrome.alarms.onAlarm.addListener(connect);
+chrome.runtime.onStartup.addListener(connect);
+chrome.runtime.onInstalled.addListener(connect);
+connect();
+)MDX";
+
+std::wstring MacDockDataPath(PCWSTR child) {
+    WCHAR base[MAX_PATH];
+    if (!ExpandEnvironmentStrings(L"%LOCALAPPDATA%\\MacDock", base,
+                                  ARRAYSIZE(base))) {
+        return L"";
+    }
+    std::wstring path = base;
+    if (child && *child) {
+        path += L"\\";
+        path += child;
+    }
+    return path;
+}
+
+bool WriteTextFile(const std::wstring& path, const char* text) {
+    HANDLE file = CreateFile(path.c_str(), GENERIC_WRITE, 0, nullptr,
+                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    DWORD written = 0;
+    const DWORD size = (DWORD)strlen(text);
+    const bool ok = WriteFile(file, text, size, &written, nullptr) &&
+                    written == size;
+    CloseHandle(file);
+    return ok;
+}
+
+// Writes the extension to %LOCALAPPDATA%\MacDock\extensao; its folder, or
+// empty if it couldn't.
+std::wstring WriteExtensionFolder() {
+    const std::wstring folder = MacDockDataPath(L"extensao");
+    if (folder.empty()) {
+        return L"";
+    }
+    SHCreateDirectoryEx(nullptr, folder.c_str(), nullptr);
+    if (!WriteTextFile(folder + L"\\manifest.json", kExtensionManifest) ||
+        !WriteTextFile(folder + L"\\protocol.js", kExtensionProtocol) ||
+        !WriteTextFile(folder + L"\\background.js", kExtensionBackground)) {
+        return L"";
+    }
+    return folder;
+}
+
+// A program's path from "App Paths" (where Chrome and Zen register).
+std::wstring AppPath(PCWSTR exe) {
+    const std::wstring key =
+        std::wstring(L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\") +
+        exe;
+    for (HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}) {
+        WCHAR value[MAX_PATH];
+        DWORD size = sizeof(value);
+        if (RegGetValue(root, key.c_str(), nullptr, RRF_RT_REG_SZ, nullptr,
+                        value, &size) == ERROR_SUCCESS) {
+            return value;
+        }
+    }
+    return L"";
+}
+
+void CopyToClipboard(const std::wstring& text) {
+    if (!OpenClipboard(nullptr)) {
+        return;
+    }
+    EmptyClipboard();
+    const size_t bytes = (text.size() + 1) * sizeof(WCHAR);
+    if (HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes)) {
+        if (void* target = GlobalLock(memory)) {
+            memcpy(target, text.c_str(), bytes);
+            GlobalUnlock(memory);
+            if (!SetClipboardData(CF_UNICODETEXT, memory)) {
+                GlobalFree(memory);
+            }
+        } else {
+            GlobalFree(memory);
+        }
+    }
+    CloseClipboard();
+}
+
+// The "Instalar no Chrome" / "Instalar no Zen" buttons (the panel's thread).
+void InstallExtension(bool zen) {
+    const std::wstring folder = WriteExtensionFolder();
+    if (folder.empty()) {
+        MessageBox(nullptr,
+                   L"Não consegui gravar a extensão em "
+                   L"%LOCALAPPDATA%\\MacDock\\extensao.",
+                   L"Mac Dock", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+        return;
+    }
+    if (!zen) {
+        CopyToClipboard(folder);
+        const std::wstring chrome = AppPath(L"chrome.exe");
+        ShellExecute(nullptr, L"open",
+                     chrome.empty() ? L"chrome.exe" : chrome.c_str(),
+                     L"chrome://extensions", nullptr, SW_SHOWNORMAL);
+        const std::wstring text =
+            L"A página de extensões do Chrome foi aberta e o caminho "
+            L"da extensão já está copiado.\n\n"
+            L"1. Ligue \"Modo do desenvolvedor\" (canto superior direito).\n"
+            L"2. Clique em \"Carregar sem compactação\".\n"
+            L"3. Cole o caminho (Ctrl+V) e confirme:\n\n" +
+            folder;
+        MessageBox(nullptr, text.c_str(), L"Mac Dock: extensão no Chrome",
+                   MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+        return;
+    }
+    const std::wstring xpi = MacDockDataPath(L"mac-dock-downloads.xpi");
+    if (GetFileAttributes(xpi.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        const std::wstring zenExe = AppPath(L"zen.exe");
+        const std::wstring args = L"\"" + xpi + L"\"";
+        ShellExecute(nullptr, L"open",
+                     zenExe.empty() ? L"zen.exe" : zenExe.c_str(),
+                     args.c_str(), nullptr, SW_SHOWNORMAL);
+        return;
+    }
+    const std::wstring dataFolder = MacDockDataPath(nullptr);
+    ShellExecute(nullptr, L"open", dataFolder.c_str(), nullptr, nullptr,
+                 SW_SHOWNORMAL);
+    const std::wstring text =
+        L"O Zen só instala extensões assinadas pela Mozilla.\n\n"
+        L"1. Assine o arquivo dist\\mac-dock-downloads.zip do repositório "
+        L"em addons.mozilla.org (\"Por conta própria\", não listada).\n"
+        L"2. Salve o .xpi assinado nesta pasta com o nome "
+        L"mac-dock-downloads.xpi:\n" +
+        dataFolder +
+        L"\n3. Clique de novo em \"Instalar no Zen\".\n\n"
+        L"Para testar antes (some ao fechar o Zen): about:debugging → "
+        L"Este Zen → Carregar extensão temporária → "
+        L"manifest.json em:\n" +
+        folder;
+    MessageBox(nullptr, text.c_str(), L"Mac Dock: extensão no Zen",
+               MB_OK | MB_ICONINFORMATION | MB_TOPMOST);
+}
+
 LRESULT CALLBACK DownloadsWndProc(HWND hWnd,
                                   UINT msg,
                                   WPARAM wParam,
@@ -10350,7 +10709,10 @@ LRESULT CALLBACK DownloadsWndProc(HWND hWnd,
         case WM_RBUTTONUP: {
             const int hit =
                 DownloadsHitTest({(short)LOWORD(lParam), (short)HIWORD(lParam)});
-            if (hit <= -100) {
+            if (hit == -5 || hit == -6) {
+                HideDownloadsPanel();
+                InstallExtension(hit == -6);
+            } else if (hit <= -100) {
                 const int index = (-100 - hit) / 2;
                 const bool cancel = (-100 - hit) % 2 == 1;
                 if (msg == WM_LBUTTONUP &&

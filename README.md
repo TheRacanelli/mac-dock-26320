@@ -31,6 +31,27 @@ barra veio de mods do **m417z**.
    [`mac-dock-26320.wh.cpp`](mac-dock-26320.wh.cpp).
 3. Clique em **Compile** e depois em **Exit editing mode**.
 
+## Extensão dos navegadores (pausar/cancelar downloads)
+
+Com a extensão **Mac Dock Downloads** ([`extension/`](extension/)), o painel de Downloads mostra
+os downloads do Chrome e do Zen com a porcentagem e botões ⏸/▶ e ✕. A dock só escuta em
+`127.0.0.1:47821` e só aceita extensões de navegador (opção **Ponte com navegadores**).
+
+**Chrome** (uma vez): no painel de Downloads, clique em **Instalar no Chrome**. A dock grava a
+extensão em `%LOCALAPPDATA%\MacDock\extensao`, copia o caminho e abre `chrome://extensions`.
+Ligue **Modo do desenvolvedor** → **Carregar sem compactação** → cole o caminho.
+
+**Zen** (uma vez): o Zen só instala extensão assinada pela Mozilla.
+
+1. Rode `pwsh tools/pack-extension.ps1` (gera `dist/mac-dock-downloads.zip`).
+2. Em [addons.mozilla.org/developers](https://addons.mozilla.org/developers/), envie o zip
+   escolhendo **Por conta própria** (não listada). A assinatura sai em minutos.
+3. Baixe o `.xpi` assinado e salve como `%LOCALAPPDATA%\MacDock\mac-dock-downloads.xpi`.
+4. No painel de Downloads, clique em **Instalar no Zen** → **Adicionar**.
+
+Testes: `node --test extension/`, `tools/test-bridge-core.ps1` (núcleo WebSocket) e, com a dock
+rodando, `pwsh tools/bridge-test.ps1`.
+
 ## Menu do clique direito preto (opcional)
 
 Instale o mod **Windows 11 Notification Center Styler** (m417z), deixe **Theme** vazio e em
