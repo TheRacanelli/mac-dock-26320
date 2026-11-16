@@ -4,7 +4,7 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock8
+// @version         3.1.0-dock9
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
@@ -474,8 +474,8 @@ O código que alcança o XAML da barra é baseado no mod
   - downloads: true
     $name: Downloads folder in the dock
     $name:pt-BR: Pasta de downloads na dock
-    $description: An icon at the dock's right end that opens a panel with the latest files in Downloads, like macOS's stack. Files still downloading in Chrome, Edge, Zen or Firefox show as they grow, the icon turns blue meanwhile, and it bounces when one finishes
-    $description:pt-BR: Um ícone na ponta direita da dock que abre um painel com os arquivos mais recentes da pasta Downloads, como a pilha do macOS. Arquivos ainda baixando no Chrome, Edge, Zen ou Firefox aparecem crescendo, o ícone fica azul enquanto isso e pula quando um termina
+    $description: An icon at the dock's right end that opens a panel with the latest files in Downloads, like macOS's stack. Files still downloading in Chrome, Edge, Zen or Firefox show as they grow, the icon turns blue, hops and shows how much came down meanwhile, and it bounces when one finishes
+    $description:pt-BR: Um ícone na ponta direita da dock que abre um painel com os arquivos mais recentes da pasta Downloads, como a pilha do macOS. Arquivos ainda baixando no Chrome, Edge, Zen ou Firefox aparecem crescendo, o ícone fica azul, pula e mostra quanto já baixou enquanto isso, e pula de novo quando um termina
   - backgroundOpacity: 50
     $name: Background color (%)
     $name:pt-BR: Cor do fundo (%)
@@ -2324,6 +2324,16 @@ constexpr UINT_PTR kDownloadsRenderTimerId = 0x4D51;
 std::atomic<bool> g_downloadsActive{false};
 std::atomic<double> g_downloadsBounceAt{0};
 std::atomic<bool> g_downloadsPanelOpen{false};
+// While something downloads: how many files and how much came down so far
+// (shown on its icon), and when the last one finished ("Pronto" for a
+// while).
+std::atomic<int> g_downloadsCount{0};
+std::atomic<ULONGLONG> g_downloadsBytes{0};
+std::atomic<double> g_downloadsDoneAt{0};
+// The Downloads stack's icon's growth under the mouse (the render thread's).
+double g_downloadsMagnification = 1;
+// (Defined further down.)
+std::wstring FormatDownloadSize(ULONGLONG size);
 // Opens or closes the panel above (x, y on the screen) (defined further
 // down).
 void ToggleDownloadsPanel(int x, int y, HWND taskbar);
@@ -3187,6 +3197,10 @@ struct DockShelf {
     winrt::Windows::Foundation::Rect downloadsRect{};
     int downloadsShows = -1;
     bool downloadsHovered = false;
+    // The text on it while downloading ("12,3 MB", "Pronto").
+    Controls::Border downloadsBadge{nullptr};
+    Controls::TextBlock downloadsText{nullptr};
+    std::wstring downloadsTextShown;
     int pinShows = 0;
     bool pinHovered = false;
     // Where it was last put, in its canvas's coordinates, and its corners.
@@ -3231,6 +3245,24 @@ DockShelf MakeDockShelf(Controls::Canvas const& host) {
         shelf.downloads.IsHitTestVisible(false);
         shelf.downloads.Visibility(Visibility::Collapsed);
         host.Children().Append(shelf.downloads);
+        shelf.downloadsBadge = Controls::Border();
+        shelf.downloadsBadge.CornerRadius(
+            CornerRadiusHelper::FromUniformRadius(7));
+        shelf.downloadsBadge.Padding(ThicknessHelper::FromLengths(5, 0, 5, 1));
+        shelf.downloadsBadge.Background(Media::SolidColorBrush(
+            winrt::Windows::UI::Color{235, 18, 18, 18}));
+        shelf.downloadsBadge.BorderBrush(Media::SolidColorBrush(
+            winrt::Windows::UI::Color{90, 255, 255, 255}));
+        shelf.downloadsBadge.BorderThickness(
+            ThicknessHelper::FromUniformLength(0.5));
+        shelf.downloadsBadge.IsHitTestVisible(false);
+        shelf.downloadsBadge.Visibility(Visibility::Collapsed);
+        shelf.downloadsText = Controls::TextBlock();
+        shelf.downloadsText.Foreground(Media::SolidColorBrush(
+            winrt::Windows::UI::Color{255, 255, 255, 255}));
+        shelf.downloadsText.FontSize(10);
+        shelf.downloadsBadge.Child(shelf.downloadsText);
+        host.Children().Append(shelf.downloadsBadge);
     }
     if (g_settings.dockPinButton) {
         shelf.pin = Controls::FontIcon();
@@ -6137,9 +6169,32 @@ bool OnRenderingUnsafe(double now, double dt) {
     busy = busy || moving;
     // (The arrow after the last icon as it's drawn.)
     double dlCenter = NAN;
+    // (As big as it grew under the mouse, like the apps' icons.)
+    double dlDrawn = dlSize;
     if (dlRoom > 0 && !placed.empty()) {
-        dlCenter = drawnRight + metrics.gap + dlSize / 2;
-        drawnRight += dlRoom;
+        const double restCenter = drawnRight + metrics.gap + dlSize / 2;
+        const double dlMax = std::max(
+            1.0, std::min(g_settings.magnification, (restBottom - 1) / dlSize));
+        double dlTarget = 1;
+        if (hovering && dlMax > 1) {
+            const double distance =
+                std::fabs(mouseX - restCenter) / g_settings.magnificationRange;
+            if (distance < 1) {
+                const double bell = 0.5 + 0.5 * std::cos(3.14159265 * distance);
+                dlTarget = 1 + (dlMax - 1) * bell;
+            }
+        }
+        double& dlMag = g_downloadsMagnification;
+        dlMag += (dlTarget - dlMag) * follow;
+        if (std::fabs(dlTarget - dlMag) < 0.002) {
+            dlMag = dlTarget;
+        } else {
+            busy = true;
+        }
+        dlDrawn = dlSize * dlMag;
+        dlCenter = drawnRight + metrics.gap + dlDrawn / 2;
+        drawnRight += metrics.gap + dlDrawn;
+        tallest = std::max(tallest, dlDrawn);
     }
     double pinCenter = NAN;
     if (pinRoom > 0 && !placed.empty()) {
@@ -6182,23 +6237,36 @@ bool OnRenderingUnsafe(double now, double dt) {
                     if (dl.Visibility() != Visibility::Collapsed) {
                         dl.Visibility(Visibility::Collapsed);
                     }
+                    if (auto badge = g_dockShelf.downloadsBadge;
+                        badge && badge.Visibility() != Visibility::Collapsed) {
+                        badge.Visibility(Visibility::Collapsed);
+                    }
                     g_dockShelf.downloadsRect = {};
                 } else {
-                    // Bouncing as a download finished.
+                    // Hopping now and then while downloading, bouncing as a
+                    // download finished.
+                    const double now = NowSeconds();
                     double lift = 0;
-                    const double since =
-                        NowSeconds() - g_downloadsBounceAt.load();
-                    if (since >= 0 && since < 5) {
+                    const double since = now - g_downloadsBounceAt.load();
+                    const bool finished =
+                        now - g_downloadsDoneAt.load() < kBounceGroupLength;
+                    if (since >= 0 && finished) {
                         bool done = true;
                         lift = BounceSequence(since, 1, &done) * dlSize *
                                kDockBounce;
                         if (!done) {
                             busy = true;
                         }
+                    } else if (since >= 0 && since < kBounceTime &&
+                               g_downloadsActive) {
+                        const double phase = since / kBounceTime;
+                        lift = 4 * phase * (1 - phase) * dlSize * kDockBounce *
+                               0.7;
+                        busy = true;
                     }
                     g_dockShelf.downloadsRect = {
-                        (float)(dlCenter - dlSize / 2 - metrics.gap / 2),
-                        (float)restTop, (float)(dlSize + metrics.gap),
+                        (float)(dlCenter - dlDrawn / 2 - metrics.gap / 2),
+                        (float)restTop, (float)(dlDrawn + metrics.gap),
                         (float)(shelfBottom - restTop)};
                     const int shows = g_downloadsActive ? 1 : 0;
                     if (shows != g_dockShelf.downloadsShows) {
@@ -6224,13 +6292,69 @@ bool OnRenderingUnsafe(double now, double dt) {
                     if (dl.Visibility() != Visibility::Visible) {
                         dl.Visibility(Visibility::Visible);
                     }
-                    dl.Width(dlSize);
-                    dl.Height(dlSize);
-                    dl.FontSize(dlSize * 0.72);
+                    dl.Width(dlDrawn);
+                    dl.Height(dlDrawn);
+                    dl.FontSize(dlDrawn * 0.72);
                     Controls::Canvas::SetLeft(
-                        dl, dlCenter - dlSize / 2 - origin.X);
+                        dl, dlCenter - dlDrawn / 2 - origin.X);
                     Controls::Canvas::SetTop(
-                        dl, restBottom - dlSize - lift - origin.Y);
+                        dl, restBottom - dlDrawn - lift - origin.Y);
+                    // What's coming down, on the icon's lower part: so far
+                    // ("12,3 MB", or "2 · 12,3 MB" for more files), then
+                    // "Pronto" for a few seconds.
+                    if (auto badge = g_dockShelf.downloadsBadge) {
+                        std::wstring text;
+                        bool doneText = false;
+                        if (g_downloadsActive) {
+                            const ULONGLONG bytes = g_downloadsBytes.load();
+                            text = bytes ? FormatDownloadSize(bytes)
+                                         : std::wstring(L"Baixando");
+                            const int count = g_downloadsCount.load();
+                            if (count > 1) {
+                                text = std::to_wstring(count) + L" \u00B7 " +
+                                       text;
+                            }
+                        } else if (now - g_downloadsDoneAt.load() < 4) {
+                            text = L"Pronto";
+                            doneText = true;
+                            busy = true;
+                        }
+                        if (text.empty()) {
+                            if (badge.Visibility() != Visibility::Collapsed) {
+                                badge.Visibility(Visibility::Collapsed);
+                            }
+                        } else {
+                            auto label = g_dockShelf.downloadsText;
+                            if (text != g_dockShelf.downloadsTextShown) {
+                                g_dockShelf.downloadsTextShown = text;
+                                label.Text(text);
+                                badge.Background(Media::SolidColorBrush(
+                                    doneText
+                                        ? winrt::Windows::UI::Color{235, 0x1F,
+                                                                    0x8F, 0x3A}
+                                        : winrt::Windows::UI::Color{235, 18,
+                                                                    18, 18}));
+                            }
+                            const double fontSize =
+                                std::max(9.0, std::round(dlDrawn * 0.3));
+                            if (label.FontSize() != fontSize) {
+                                label.FontSize(fontSize);
+                            }
+                            if (badge.Visibility() != Visibility::Visible) {
+                                badge.Visibility(Visibility::Visible);
+                            }
+                            badge.Measure(winrt::Windows::Foundation::Size{
+                                INFINITY, INFINITY});
+                            const auto desired = badge.DesiredSize();
+                            Controls::Canvas::SetLeft(
+                                badge, std::round(dlCenter - desired.Width / 2 -
+                                                  origin.X));
+                            Controls::Canvas::SetTop(
+                                badge,
+                                std::round(restBottom - lift - desired.Height +
+                                           2 - origin.Y));
+                        }
+                    }
                 }
             }
             if (auto pin = g_dockShelf.pin) {
@@ -9271,12 +9395,16 @@ constexpr UINT kDownloadsToggle = WM_APP + 10;
 constexpr int kDownloadsMax = 12;
 constexpr int kDownloadsColumns = 4;
 constexpr WCHAR kDownloadsClass[] = L"WindhawkMacDockDownloads";
-// Panel measures, in DIPs.
+// Panel measures, in DIPs: the header, the grid's tiles and the list's rows.
 constexpr int kDlPad = 14;
-constexpr int kDlHeader = 34;
-constexpr int kDlTileWidth = 104;
-constexpr int kDlTileHeight = 116;
-constexpr int kDlThumb = 64;
+constexpr int kDlHeader = 40;
+constexpr int kDlTileWidth = 116;
+constexpr int kDlTileHeight = 140;
+constexpr int kDlThumb = 56;
+constexpr int kDlListWidth = 440;
+constexpr int kDlRowHeight = 52;
+constexpr int kDlListThumb = 34;
+constexpr int kDlButton = 30;
 
 struct DownloadItem {
     std::wstring path;
@@ -9307,6 +9435,18 @@ HFONT g_dlTitleFont;
 HFONT g_dlFont;
 HFONT g_dlSmallFont;
 HFONT g_dlGlyphFont;
+HFONT g_dlListGlyphFont;
+HFONT g_dlIconFont;
+// How the panel shows the files: 0 in a grid, 1 in a list (kept between
+// sessions), -1 not read yet.
+int g_downloadsView = -1;
+
+int DownloadsView() {
+    if (g_downloadsView < 0) {
+        g_downloadsView = Wh_GetIntValue(L"downloadsView", 0) == 1 ? 1 : 0;
+    }
+    return g_downloadsView;
+}
 
 bool EndsWithI(const std::wstring& text, PCWSTR suffix) {
     const size_t length = wcslen(suffix);
@@ -9409,6 +9549,26 @@ void ScanDownloads() {
         return false;
     });
     const int partials = (int)partialNames.size();
+    // (A growing file's size in the folder's listing lags behind: asked of
+    // the file itself.)
+    ULONGLONG partialBytes = 0;
+    for (auto& item : found) {
+        if (!item.partial) {
+            continue;
+        }
+        HANDLE file = CreateFile(
+            item.path.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+            OPEN_EXISTING, 0, nullptr);
+        if (file != INVALID_HANDLE_VALUE) {
+            LARGE_INTEGER size{};
+            if (GetFileSizeEx(file, &size)) {
+                item.size = (ULONGLONG)size.QuadPart;
+            }
+            CloseHandle(file);
+        }
+        partialBytes += item.size;
+    }
     std::sort(found.begin(), found.end(),
               [](const DownloadItem& a, const DownloadItem& b) {
                   if (a.partial != b.partial) {
@@ -9437,10 +9597,21 @@ void ScanDownloads() {
     FreeDownloadThumbs(g_downloadItems);
     g_downloadItems = std::move(found);
 
-    // One finished (fewer downloading than before): the icon bounces.
+    // One finished (fewer downloading than before): the icon bounces. One
+    // started, and every few seconds while downloading: it hops.
     bool poke = false;
+    const double now = NowSeconds();
     if (partials < g_downloadsPartials) {
-        g_downloadsBounceAt = NowSeconds();
+        g_downloadsBounceAt = now;
+        g_downloadsDoneAt = now;
+        poke = true;
+    } else if (partials > g_downloadsPartials ||
+               (partials > 0 && now - g_downloadsBounceAt.load() >= 3.5)) {
+        g_downloadsBounceAt = now;
+        poke = true;
+    }
+    g_downloadsCount = partials;
+    if (g_downloadsBytes.exchange(partialBytes) != partialBytes) {
         poke = true;
     }
     g_downloadsPartials = partials;
@@ -9459,7 +9630,7 @@ void ScanDownloads() {
 
 void MakeDownloadsFonts() {
     for (HFONT* font : {&g_dlTitleFont, &g_dlFont, &g_dlSmallFont,
-                        &g_dlGlyphFont}) {
+                        &g_dlGlyphFont, &g_dlListGlyphFont, &g_dlIconFont}) {
         if (*font) {
             DeleteObject(*font);
             *font = nullptr;
@@ -9475,14 +9646,24 @@ void MakeDownloadsFonts() {
     g_dlFont = make(12, FW_NORMAL, L"Segoe UI");
     g_dlSmallFont = make(11, FW_NORMAL, L"Segoe UI");
     g_dlGlyphFont = make(40, FW_NORMAL, L"Segoe Fluent Icons");
+    g_dlListGlyphFont = make(24, FW_NORMAL, L"Segoe Fluent Icons");
+    g_dlIconFont = make(14, FW_NORMAL, L"Segoe Fluent Icons");
 }
 
 int DownloadsRows() {
     const int count = (int)g_downloadItems.size();
+    if (DownloadsView() == 1) {
+        return std::max(1, count);
+    }
     return std::max(1, (count + kDownloadsColumns - 1) / kDownloadsColumns);
 }
 
 RECT DownloadTileRect(int index) {
+    if (DownloadsView() == 1) {
+        const int left = DlPx(kDlPad);
+        const int top = DlPx(kDlPad + kDlHeader + index * kDlRowHeight);
+        return {left, top, left + DlPx(kDlListWidth), top + DlPx(kDlRowHeight)};
+    }
     const int column = index % kDownloadsColumns;
     const int row = index / kDownloadsColumns;
     const int left = DlPx(kDlPad + column * kDlTileWidth);
@@ -9493,8 +9674,16 @@ RECT DownloadTileRect(int index) {
 RECT DownloadsFolderLinkRect() {
     RECT client{};
     GetClientRect(g_downloadsWnd, &client);
-    return {client.right - DlPx(kDlPad + 110), DlPx(kDlPad - 4),
-            client.right - DlPx(kDlPad), DlPx(kDlPad + kDlHeader - 10)};
+    return {client.right - DlPx(kDlPad + 96), DlPx(kDlPad),
+            client.right - DlPx(kDlPad), DlPx(kDlPad + 28)};
+}
+
+// The buttons that show the files in a grid (0) or a list (1), left of
+// "Abrir pasta".
+RECT DownloadsViewButtonRect(int view) {
+    const RECT link = DownloadsFolderLinkRect();
+    const int right = link.left - DlPx(8) - (view == 0 ? DlPx(kDlButton + 2) : 0);
+    return {right - DlPx(kDlButton), link.top, right, link.bottom};
 }
 
 void PlaceDownloadsPanel() {
@@ -9518,9 +9707,11 @@ void PlaceDownloadsPanel() {
     }
     MONITORINFO info{sizeof(info)};
     GetMonitorInfo(monitor, &info);
-    const int width = DlPx(kDlPad * 2 + kDownloadsColumns * kDlTileWidth);
-    const int height =
-        DlPx(kDlPad * 2 + kDlHeader + DownloadsRows() * kDlTileHeight);
+    const bool list = DownloadsView() == 1;
+    const int width = DlPx(kDlPad * 2 + (list ? kDlListWidth
+                                              : kDownloadsColumns * kDlTileWidth));
+    const int height = DlPx(kDlPad * 2 + kDlHeader +
+                            DownloadsRows() * (list ? kDlRowHeight : kDlTileHeight));
     const int margin = DlPx(10);
     int left = g_downloadsAnchor.x - width / 2;
     left = std::min(left, (int)info.rcMonitor.right - margin - width);
@@ -9553,19 +9744,112 @@ void DrawDownloadThumb(HDC hdc, HBITMAP bitmap, const RECT& box) {
     }
     const int width = info.bmWidth;
     const int height = std::abs(info.bmHeight);
-    const int x = box.left + (box.right - box.left - width) / 2;
-    const int y = box.top + (box.bottom - box.top - height) / 2;
+    // (Made smaller to fit, for the list's rows.)
+    const double fit = std::min({1.0, (box.right - box.left) / (double)width,
+                                 (box.bottom - box.top) / (double)height});
+    const int drawWidth = std::max(1, (int)(width * fit));
+    const int drawHeight = std::max(1, (int)(height * fit));
+    const int x = box.left + (box.right - box.left - drawWidth) / 2;
+    const int y = box.top + (box.bottom - box.top - drawHeight) / 2;
     HDC source = CreateCompatibleDC(hdc);
     HGDIOBJ previous = SelectObject(source, bitmap);
     if (info.bmBitsPixel == 32) {
         BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
-        AlphaBlend(hdc, x, y, width, height, source, 0, 0, width, height,
-                   blend);
+        AlphaBlend(hdc, x, y, drawWidth, drawHeight, source, 0, 0, width,
+                   height, blend);
     } else {
-        BitBlt(hdc, x, y, width, height, source, 0, 0, SRCCOPY);
+        SetStretchBltMode(hdc, HALFTONE);
+        StretchBlt(hdc, x, y, drawWidth, drawHeight, source, 0, 0, width,
+                   height, SRCCOPY);
     }
     SelectObject(source, previous);
     DeleteDC(source);
+}
+
+int TextWidth(HDC hdc, const std::wstring& text) {
+    SIZE size{};
+    GetTextExtentPoint32(hdc, text.c_str(), (int)text.size(), &size);
+    return size.cx;
+}
+
+// The text as it fits in `width`, cut in the middle so its end (the
+// extension) still shows.
+std::wstring FitText(HDC hdc, const std::wstring& text, int width) {
+    if (TextWidth(hdc, text) <= width) {
+        return text;
+    }
+    const size_t tail = std::min<size_t>(text.size() / 3, 9);
+    const std::wstring end = text.substr(text.size() - tail);
+    size_t low = 0;
+    size_t high = text.size() - tail;
+    // (The longest start that fits.)
+    while (low < high) {
+        const size_t mid = (low + high + 1) / 2;
+        if (TextWidth(hdc, text.substr(0, mid) + L"\u2026" + end) <= width) {
+            low = mid;
+        } else {
+            high = mid - 1;
+        }
+    }
+    return text.substr(0, low) + L"\u2026" + end;
+}
+
+// The text on two lines of `width`, broken after a space, a dash, a dot or an
+// underscore when there's one, the second cut in the middle if needed.
+void SplitTwoLines(HDC hdc,
+                   const std::wstring& text,
+                   int width,
+                   std::wstring* first,
+                   std::wstring* second) {
+    int fits = 0;
+    SIZE size{};
+    GetTextExtentExPoint(hdc, text.c_str(), (int)text.size(), width, &fits,
+                         nullptr, &size);
+    if (fits >= (int)text.size()) {
+        *first = text;
+        second->clear();
+        return;
+    }
+    fits = std::max(1, fits);
+    int split = fits;
+    for (int i = fits; i > fits / 2; i--) {
+        const WCHAR c = text[i - 1];
+        if (c == L' ' || c == L'-' || c == L'_' || c == L'.') {
+            split = i;
+            break;
+        }
+    }
+    *first = text.substr(0, split);
+    std::wstring rest = text.substr(split);
+    while (!rest.empty() && rest[0] == L' ') {
+        rest.erase(0, 1);
+    }
+    *second = FitText(hdc, rest, width);
+}
+
+int LineHeight(HDC hdc) {
+    TEXTMETRIC metrics{};
+    GetTextMetrics(hdc, &metrics);
+    return metrics.tmHeight;
+}
+
+std::wstring FormatDownloadTime(const FILETIME& time) {
+    FILETIME local{};
+    SYSTEMTIME at{};
+    if (!FileTimeToLocalFileTime(&time, &local) ||
+        !FileTimeToSystemTime(&local, &at)) {
+        return L"";
+    }
+    SYSTEMTIME today{};
+    GetLocalTime(&today);
+    WCHAR text[32];
+    if (at.wYear == today.wYear && at.wMonth == today.wMonth &&
+        at.wDay == today.wDay) {
+        swprintf_s(text, L"hoje, %02d:%02d", at.wHour, at.wMinute);
+    } else {
+        swprintf_s(text, L"%02d/%02d/%04d", at.wDay, at.wMonth, at.wYear);
+    }
+    return text;
 }
 
 void FillRounded(HDC hdc, const RECT& rect, int radius, COLORREF color) {
@@ -9595,21 +9879,40 @@ void PaintDownloads(HWND hWnd, HDC target) {
     constexpr COLORREF kWhite = RGB(240, 240, 240);
     constexpr COLORREF kGray = RGB(150, 150, 150);
     constexpr COLORREF kBlue = RGB(0x4C, 0xC2, 0xFF);
+    constexpr COLORREF kHover = RGB(38, 38, 38);
+    const bool list = DownloadsView() == 1;
 
+    // The header: the title, the grid and list buttons and "Abrir pasta".
+    const RECT link = DownloadsFolderLinkRect();
+    const RECT gridButton = DownloadsViewButtonRect(0);
     HGDIOBJ oldFont = SelectObject(hdc, g_dlTitleFont);
     SetTextColor(hdc, kWhite);
-    RECT title{DlPx(kDlPad + 6), DlPx(kDlPad - 4), client.right / 2,
-               DlPx(kDlPad + kDlHeader - 10)};
+    RECT title{DlPx(kDlPad + 6), link.top, gridButton.left - DlPx(8),
+               link.bottom};
     DrawText(hdc, L"Downloads", -1, &title,
-             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+    SelectObject(hdc, g_dlIconFont);
+    for (int view = 0; view < 2; view++) {
+        RECT button = DownloadsViewButtonRect(view);
+        const bool chosen = DownloadsView() == view;
+        const bool hovered = g_downloadsHover == -3 - view;
+        if (chosen || hovered) {
+            FillRounded(hdc, button, DlPx(8),
+                        chosen ? RGB(52, 52, 52) : kHover);
+        }
+        SetTextColor(hdc, chosen || hovered ? kWhite : kGray);
+        DrawText(hdc, view == 0 ? L"\uE80A" : L"\uE8FD", -1, &button,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
 
     SelectObject(hdc, g_dlFont);
-    RECT link = DownloadsFolderLinkRect();
+    RECT linkText = link;
     if (g_downloadsHover == -2) {
-        FillRounded(hdc, link, DlPx(10), RGB(38, 38, 38));
+        FillRounded(hdc, link, DlPx(10), kHover);
     }
     SetTextColor(hdc, g_downloadsHover == -2 ? kWhite : kBlue);
-    DrawText(hdc, L"Abrir pasta", -1, &link,
+    DrawText(hdc, L"Abrir pasta", -1, &linkText,
              DT_CENTER | DT_VCENTER | DT_SINGLELINE);
 
     if (g_downloadItems.empty()) {
@@ -9620,23 +9923,35 @@ void PaintDownloads(HWND hWnd, HDC target) {
                  DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     }
 
+    SelectObject(hdc, g_dlFont);
+    const int nameLine = LineHeight(hdc);
+    SelectObject(hdc, g_dlSmallFont);
+    const int smallLine = LineHeight(hdc);
+
     for (int i = 0; i < (int)g_downloadItems.size(); i++) {
         DownloadItem& item = g_downloadItems[i];
         const RECT tile = DownloadTileRect(i);
         if (g_downloadsHover == i) {
             RECT hover = tile;
-            InflateRect(&hover, -DlPx(3), -DlPx(3));
-            FillRounded(hdc, hover, DlPx(12), RGB(38, 38, 38));
+            InflateRect(&hover, list ? 0 : -DlPx(3), list ? -DlPx(2) : -DlPx(3));
+            FillRounded(hdc, hover, DlPx(12), kHover);
         }
-        const RECT box{tile.left + (tile.right - tile.left - DlPx(kDlThumb)) / 2,
-                       tile.top + DlPx(8),
-                       tile.left + (tile.right - tile.left + DlPx(kDlThumb)) / 2,
-                       tile.top + DlPx(8 + kDlThumb)};
+        const int thumb = DlPx(list ? kDlListThumb : kDlThumb);
+        RECT box;
+        if (list) {
+            const int top = tile.top + (tile.bottom - tile.top - thumb) / 2;
+            box = {tile.left + DlPx(10), top, tile.left + DlPx(10) + thumb,
+                   top + thumb};
+        } else {
+            const int left = tile.left + (tile.right - tile.left - thumb) / 2;
+            box = {left, tile.top + DlPx(10), left + thumb,
+                   tile.top + DlPx(10) + thumb};
+        }
         if (item.partial) {
-            SelectObject(hdc, g_dlGlyphFont);
+            SelectObject(hdc, list ? g_dlListGlyphFont : g_dlGlyphFont);
             SetTextColor(hdc, kBlue);
             RECT glyph = box;
-            DrawText(hdc, L"", -1, &glyph,
+            DrawText(hdc, L"\uE896", -1, &glyph,
                      DT_CENTER | DT_VCENTER | DT_SINGLELINE);
         } else {
             if (!item.thumbTried) {
@@ -9647,25 +9962,65 @@ void PaintDownloads(HWND hWnd, HDC target) {
                 DrawDownloadThumb(hdc, item.thumb, box);
             }
         }
+
+        std::wstring detail = FormatDownloadSize(item.size);
+        if (item.partial) {
+            detail = L"Baixando\u2026 " + detail;
+        } else if (list) {
+            const std::wstring when = FormatDownloadTime(item.time);
+            if (!when.empty()) {
+                detail += L"  \u00B7  " + when;
+            }
+        }
+
+        if (list) {
+            const int textLeft = box.right + DlPx(12);
+            const int textRight = tile.right - DlPx(12);
+            const int textTop = tile.top + (tile.bottom - tile.top -
+                                            nameLine - smallLine - DlPx(2)) / 2;
+            SelectObject(hdc, g_dlFont);
+            SetTextColor(hdc, kWhite);
+            const std::wstring name =
+                FitText(hdc, item.name, textRight - textLeft);
+            RECT nameRect{textLeft, textTop, textRight, textTop + nameLine};
+            DrawText(hdc, name.c_str(), -1, &nameRect,
+                     DT_LEFT | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+            SelectObject(hdc, g_dlSmallFont);
+            SetTextColor(hdc, item.partial ? kBlue : kGray);
+            RECT detailRect{textLeft, nameRect.bottom + DlPx(2), textRight,
+                            nameRect.bottom + DlPx(2) + smallLine};
+            DrawText(hdc, detail.c_str(), -1, &detailRect,
+                     DT_LEFT | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS |
+                         DT_NOPREFIX);
+            continue;
+        }
+
+        // The name on up to two lines, then the size, all inside the tile.
+        const int textLeft = tile.left + DlPx(8);
+        const int textRight = tile.right - DlPx(8);
         SelectObject(hdc, g_dlFont);
         SetTextColor(hdc, kWhite);
-        RECT name{tile.left + DlPx(6), box.bottom + DlPx(4),
-                  tile.right - DlPx(6), box.bottom + DlPx(4 + 30)};
-        DrawText(hdc, item.name.c_str(), -1, &name,
-                 DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_EDITCONTROL |
-                     DT_NOPREFIX);
-        SelectObject(hdc, g_dlSmallFont);
-        RECT detail{tile.left + DlPx(4), name.bottom, tile.right - DlPx(4),
-                    tile.bottom - DlPx(2)};
-        std::wstring text = FormatDownloadSize(item.size);
-        if (item.partial) {
-            text = L"Baixando… " + text;
-            SetTextColor(hdc, kBlue);
-        } else {
-            SetTextColor(hdc, kGray);
+        std::wstring first;
+        std::wstring second;
+        SplitTwoLines(hdc, item.name, textRight - textLeft, &first, &second);
+        int y = box.bottom + DlPx(6);
+        for (const std::wstring* line : {&first, &second}) {
+            if (line->empty()) {
+                continue;
+            }
+            RECT lineRect{textLeft, y, textRight, y + nameLine};
+            DrawText(hdc, line->c_str(), -1, &lineRect,
+                     DT_CENTER | DT_TOP | DT_SINGLELINE | DT_NOPREFIX);
+            y += nameLine;
         }
-        DrawText(hdc, text.c_str(), -1, &detail,
-                 DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+        SelectObject(hdc, g_dlSmallFont);
+        SetTextColor(hdc, item.partial ? kBlue : kGray);
+        const int detailTop = box.bottom + DlPx(6) + nameLine * 2 + DlPx(2);
+        RECT detailRect{textLeft - DlPx(4), detailTop, textRight + DlPx(4),
+                        detailTop + smallLine};
+        DrawText(hdc, detail.c_str(), -1, &detailRect,
+                 DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS |
+                     DT_NOPREFIX);
     }
 
     SelectObject(hdc, oldFont);
@@ -9675,10 +10030,18 @@ void PaintDownloads(HWND hWnd, HDC target) {
     DeleteDC(hdc);
 }
 
+// What's at `pt`: a file's index, -2 for "Abrir pasta", -3 and -4 for the
+// grid and list buttons, -1 for nothing.
 int DownloadsHitTest(POINT pt) {
     const RECT link = DownloadsFolderLinkRect();
     if (PtInRect(&link, pt)) {
         return -2;
+    }
+    for (int view = 0; view < 2; view++) {
+        const RECT button = DownloadsViewButtonRect(view);
+        if (PtInRect(&button, pt)) {
+            return -3 - view;
+        }
     }
     for (int i = 0; i < (int)g_downloadItems.size(); i++) {
         const RECT tile = DownloadTileRect(i);
@@ -9744,7 +10107,15 @@ LRESULT CALLBACK DownloadsWndProc(HWND hWnd,
         case WM_RBUTTONUP: {
             const int hit =
                 DownloadsHitTest({(short)LOWORD(lParam), (short)HIWORD(lParam)});
-            if (hit == -2) {
+            if (hit == -3 || hit == -4) {
+                const int view = hit == -3 ? 0 : 1;
+                if (view != DownloadsView()) {
+                    g_downloadsView = view;
+                    Wh_SetIntValue(L"downloadsView", view);
+                    PlaceDownloadsPanel();
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                }
+            } else if (hit == -2) {
                 HideDownloadsPanel();
                 ShellExecute(nullptr, L"open", g_downloadsDir.c_str(), nullptr,
                              nullptr, SW_SHOWNORMAL);
@@ -9884,7 +10255,7 @@ DWORD WINAPI DownloadsThreadProc(LPVOID started) {
     g_downloadItems.clear();
     g_downloadsPartials = 0;
     for (HFONT* font : {&g_dlTitleFont, &g_dlFont, &g_dlSmallFont,
-                        &g_dlGlyphFont}) {
+                        &g_dlGlyphFont, &g_dlListGlyphFont, &g_dlIconFont}) {
         if (*font) {
             DeleteObject(*font);
             *font = nullptr;
