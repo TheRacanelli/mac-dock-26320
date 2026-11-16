@@ -4,7 +4,7 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock9
+// @version         3.1.0-dock10
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
@@ -2334,6 +2334,28 @@ std::atomic<double> g_downloadsDoneAt{0};
 double g_downloadsMagnification = 1;
 // (Defined further down.)
 std::wstring FormatDownloadSize(ULONGLONG size);
+
+// A size short enough for the icon's caption: "850 KB", "4,5 MB", "14 MB",
+// "1,2 GB".
+std::wstring CompactDownloadSize(ULONGLONG size) {
+    WCHAR text[32];
+    const double mb = size / (1024.0 * 1024);
+    if (size >= 1024ull * 1024 * 1024) {
+        swprintf_s(text, L"%.1f GB", mb / 1024);
+    } else if (mb >= 10) {
+        swprintf_s(text, L"%.0f MB", mb);
+    } else if (mb >= 1) {
+        swprintf_s(text, L"%.1f MB", mb);
+    } else {
+        swprintf_s(text, L"%llu KB", (size + 1023) / 1024);
+    }
+    for (WCHAR* c = text; *c; c++) {
+        if (*c == L'.') {
+            *c = L',';
+        }
+    }
+    return text;
+}
 // Opens or closes the panel above (x, y on the screen) (defined further
 // down).
 void ToggleDownloadsPanel(int x, int y, HWND taskbar);
@@ -3246,21 +3268,17 @@ DockShelf MakeDockShelf(Controls::Canvas const& host) {
         shelf.downloads.Visibility(Visibility::Collapsed);
         host.Children().Append(shelf.downloads);
         shelf.downloadsBadge = Controls::Border();
-        shelf.downloadsBadge.CornerRadius(
-            CornerRadiusHelper::FromUniformRadius(7));
-        shelf.downloadsBadge.Padding(ThicknessHelper::FromLengths(5, 0, 5, 1));
-        shelf.downloadsBadge.Background(Media::SolidColorBrush(
-            winrt::Windows::UI::Color{235, 18, 18, 18}));
-        shelf.downloadsBadge.BorderBrush(Media::SolidColorBrush(
-            winrt::Windows::UI::Color{90, 255, 255, 255}));
-        shelf.downloadsBadge.BorderThickness(
-            ThicknessHelper::FromUniformLength(0.5));
         shelf.downloadsBadge.IsHitTestVisible(false);
         shelf.downloadsBadge.Visibility(Visibility::Collapsed);
         shelf.downloadsText = Controls::TextBlock();
         shelf.downloadsText.Foreground(Media::SolidColorBrush(
             winrt::Windows::UI::Color{255, 255, 255, 255}));
         shelf.downloadsText.FontSize(10);
+        shelf.downloadsText.TextAlignment(TextAlignment::Center);
+        shelf.downloadsText.HorizontalAlignment(HorizontalAlignment::Center);
+        shelf.downloadsText.VerticalAlignment(VerticalAlignment::Center);
+        shelf.downloadsText.FontWeight(
+            winrt::Windows::UI::Text::FontWeight{600});
         shelf.downloadsBadge.Child(shelf.downloadsText);
         host.Children().Append(shelf.downloadsBadge);
     }
@@ -6292,33 +6310,33 @@ bool OnRenderingUnsafe(double now, double dt) {
                     if (dl.Visibility() != Visibility::Visible) {
                         dl.Visibility(Visibility::Visible);
                     }
+                    // What's coming down, under a smaller arrow, inside the
+                    // icon's square: so far ("14 MB"), then "Pronto" for a
+                    // few seconds.
+                    std::wstring text;
+                    bool doneText = false;
+                    if (g_downloadsActive) {
+                        const ULONGLONG bytes = g_downloadsBytes.load();
+                        text = bytes ? CompactDownloadSize(bytes)
+                                     : std::wstring(L"\u2026");
+                    } else if (now - g_downloadsDoneAt.load() < 4) {
+                        text = L"Pronto";
+                        doneText = true;
+                        busy = true;
+                    }
+                    const double captionSize =
+                        std::max(9.0, std::round(dlDrawn * 0.28));
+                    const double captionHeight =
+                        text.empty() ? 0 : std::ceil(captionSize * 1.3);
+                    const double glyphBox = dlDrawn - captionHeight;
                     dl.Width(dlDrawn);
-                    dl.Height(dlDrawn);
-                    dl.FontSize(dlDrawn * 0.72);
+                    dl.Height(glyphBox);
+                    dl.FontSize(text.empty() ? dlDrawn * 0.72 : glyphBox * 0.8);
                     Controls::Canvas::SetLeft(
                         dl, dlCenter - dlDrawn / 2 - origin.X);
                     Controls::Canvas::SetTop(
                         dl, restBottom - dlDrawn - lift - origin.Y);
-                    // What's coming down, on the icon's lower part: so far
-                    // ("12,3 MB", or "2 · 12,3 MB" for more files), then
-                    // "Pronto" for a few seconds.
                     if (auto badge = g_dockShelf.downloadsBadge) {
-                        std::wstring text;
-                        bool doneText = false;
-                        if (g_downloadsActive) {
-                            const ULONGLONG bytes = g_downloadsBytes.load();
-                            text = bytes ? FormatDownloadSize(bytes)
-                                         : std::wstring(L"Baixando");
-                            const int count = g_downloadsCount.load();
-                            if (count > 1) {
-                                text = std::to_wstring(count) + L" \u00B7 " +
-                                       text;
-                            }
-                        } else if (now - g_downloadsDoneAt.load() < 4) {
-                            text = L"Pronto";
-                            doneText = true;
-                            busy = true;
-                        }
                         if (text.empty()) {
                             if (badge.Visibility() != Visibility::Collapsed) {
                                 badge.Visibility(Visibility::Collapsed);
@@ -6328,31 +6346,29 @@ bool OnRenderingUnsafe(double now, double dt) {
                             if (text != g_dockShelf.downloadsTextShown) {
                                 g_dockShelf.downloadsTextShown = text;
                                 label.Text(text);
-                                badge.Background(Media::SolidColorBrush(
+                                label.Foreground(Media::SolidColorBrush(
                                     doneText
-                                        ? winrt::Windows::UI::Color{235, 0x1F,
-                                                                    0x8F, 0x3A}
-                                        : winrt::Windows::UI::Color{235, 18,
-                                                                    18, 18}));
+                                        ? winrt::Windows::UI::Color{255, 0x5E,
+                                                                    0xD8, 0x7A}
+                                        : winrt::Windows::UI::Color{255, 0x4C,
+                                                                    0xC2,
+                                                                    0xFF}));
                             }
-                            const double fontSize =
-                                std::max(9.0, std::round(dlDrawn * 0.3));
-                            if (label.FontSize() != fontSize) {
-                                label.FontSize(fontSize);
+                            if (label.FontSize() != captionSize) {
+                                label.FontSize(captionSize);
                             }
                             if (badge.Visibility() != Visibility::Visible) {
                                 badge.Visibility(Visibility::Visible);
                             }
-                            badge.Measure(winrt::Windows::Foundation::Size{
-                                INFINITY, INFINITY});
-                            const auto desired = badge.DesiredSize();
+                            badge.Width(dlDrawn + metrics.gap);
+                            badge.Height(captionHeight);
                             Controls::Canvas::SetLeft(
-                                badge, std::round(dlCenter - desired.Width / 2 -
+                                badge, std::round(dlCenter -
+                                                  (dlDrawn + metrics.gap) / 2 -
                                                   origin.X));
                             Controls::Canvas::SetTop(
-                                badge,
-                                std::round(restBottom - lift - desired.Height +
-                                           2 - origin.Y));
+                                badge, std::round(restBottom - captionHeight -
+                                                  lift - origin.Y));
                         }
                     }
                 }
