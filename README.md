@@ -19,6 +19,9 @@ barra veio de mods do **m417z**.
 - **Menu do clique direito** abre centralizado em cima do ícone clicado.
 - **Setinha de fixar/esconder por monitor** na ponta direita da dock (opção `dock.pinButton`).
   Cada monitor lembra a escolha, e o monitor com a dock fixa continua reservando o espaço dela.
+- **Pasta de downloads** na dock (opção `dock.downloads`): painel preto com os arquivos mais
+  recentes, downloads do Chrome/Edge/Zen/Firefox aparecendo enquanto baixam, ícone azul durante
+  o download e pulando quando termina.
 
 ## Instalar
 

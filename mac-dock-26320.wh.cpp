@@ -4,7 +4,7 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock7
+// @version         3.1.0-dock8
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
@@ -471,6 +471,11 @@ O código que alcança o XAML da barra é baseado no mod
     $name:pt-BR: Botão para fixar ou esconder a dock (por monitor)
     $description: A small arrow at the dock's right end, like the island's. Down hides the dock on that monitor (it comes back with the mouse at the bottom edge); up keeps it shown there. Each monitor remembers its choice, over "Hide the taskbar until the mouse reaches the bottom edge"
     $description:pt-BR: Uma setinha na ponta direita da dock, como a da island. Para baixo esconde a dock naquele monitor (ela volta com o mouse na borda de baixo); para cima deixa ela fixa ali. Cada monitor lembra a sua escolha, por cima de "Esconder a barra até o mouse chegar na borda de baixo"
+  - downloads: true
+    $name: Downloads folder in the dock
+    $name:pt-BR: Pasta de downloads na dock
+    $description: An icon at the dock's right end that opens a panel with the latest files in Downloads, like macOS's stack. Files still downloading in Chrome, Edge, Zen or Firefox show as they grow, the icon turns blue meanwhile, and it bounces when one finishes
+    $description:pt-BR: Um ícone na ponta direita da dock que abre um painel com os arquivos mais recentes da pasta Downloads, como a pilha do macOS. Arquivos ainda baixando no Chrome, Edge, Zen ou Firefox aparecem crescendo, o ícone fica azul enquanto isso e pula quando um termina
   - backgroundOpacity: 50
     $name: Background color (%)
     $name:pt-BR: Cor do fundo (%)
@@ -945,6 +950,8 @@ struct {
     bool dockIslandStyle;
     // The arrow that pins or hides each monitor's dock (dock.pinButton).
     bool dockPinButton;
+    // The Downloads stack (dock.downloads).
+    bool dockDownloads;
     double backgroundOpacity;
     int showDuration;
     int hideDuration;
@@ -2309,6 +2316,17 @@ constexpr UINT_PTR kUnhideTimerId = 3;
 // A dock kept shown with its arrow went down anyway: it's shown again (see
 // TrayUI_SlideWindow_Hook and SyncPinnedBars).
 constexpr UINT_PTR kPinnedShowTimerId = 0x4D50;
+// The Downloads stack changed (see ScanDownloads): the dock draws again.
+constexpr UINT_PTR kDownloadsRenderTimerId = 0x4D51;
+// Something downloading in Downloads now, when the last one finished (in
+// NowSeconds() time: its icon bounces), and whether its panel is open (the
+// dock stays up meanwhile).
+std::atomic<bool> g_downloadsActive{false};
+std::atomic<double> g_downloadsBounceAt{0};
+std::atomic<bool> g_downloadsPanelOpen{false};
+// Opens or closes the panel above (x, y on the screen) (defined further
+// down).
+void ToggleDownloadsPanel(int x, int y, HWND taskbar);
 
 BOOL CALLBACK FindTaskbarProc(HWND hWnd, LPARAM lParam) {
     DWORD dwProcessId;
@@ -3163,6 +3181,12 @@ struct DockShelf {
     // is kept shown; 2 up: it hides itself), and whether the mouse is on it.
     Controls::FontIcon pin{nullptr};
     winrt::Windows::Foundation::Rect pinRect{};
+    // The Downloads stack's icon (dock.downloads), where it takes clicks,
+    // and whether it shows something downloading (blue).
+    Controls::FontIcon downloads{nullptr};
+    winrt::Windows::Foundation::Rect downloadsRect{};
+    int downloadsShows = -1;
+    bool downloadsHovered = false;
     int pinShows = 0;
     bool pinHovered = false;
     // Where it was last put, in its canvas's coordinates, and its corners.
@@ -3198,6 +3222,15 @@ DockShelf MakeDockShelf(Controls::Canvas const& host) {
             shelf.path.Visibility(Visibility::Collapsed);
         }
         host.Children().Append(shelf.path);
+    }
+    if (g_settings.dockDownloads) {
+        shelf.downloads = Controls::FontIcon();
+        shelf.downloads.FontFamily(Media::FontFamily(L"Segoe Fluent Icons"));
+        shelf.downloads.Glyph(L"\uE896");
+        shelf.downloads.Opacity(0.85);
+        shelf.downloads.IsHitTestVisible(false);
+        shelf.downloads.Visibility(Visibility::Collapsed);
+        host.Children().Append(shelf.downloads);
     }
     if (g_settings.dockPinButton) {
         shelf.pin = Controls::FontIcon();
@@ -5768,6 +5801,13 @@ bool OnRenderingUnsafe(double now, double dt) {
             ? std::max(12.0, metrics.icon * 0.5)
             : 0;
     const double pinRoom = pinSize > 0 ? metrics.gap + pinSize : 0;
+    // The Downloads stack, as big as an app's icon, before the arrow.
+    const double dlSize =
+        dock && g_settings.dockDownloads && g_dockShelf.downloads
+            ? metrics.icon
+            : 0;
+    const double dlRoom = dlSize > 0 ? metrics.gap + dlSize : 0;
+    const double extraRoom = pinRoom + dlRoom;
     double boxLeft = -kNoBox;
     double boxRight = kNoBox;
     g_dockScrollMax = 0;
@@ -5784,12 +5824,12 @@ bool OnRenderingUnsafe(double now, double dt) {
         if (widest > metrics.icon && rowWidth > widest) {
             shown = widest;
             g_dockScrollMax = rowWidth - widest;
-            boxLeft = bounds.X + bounds.Width / 2 - (shown + pinRoom) / 2;
+            boxLeft = bounds.X + bounds.Width / 2 - (shown + extraRoom) / 2;
             boxRight = boxLeft + shown;
         }
         g_dockScrollStep = metrics.icon + metrics.gap;
         g_dockScroll = std::clamp(g_dockScroll, 0.0, g_dockScrollMax);
-        double x = bounds.X + bounds.Width / 2 - (shown + pinRoom) / 2 -
+        double x = bounds.X + bounds.Width / 2 - (shown + extraRoom) / 2 -
                    g_dockScroll;
         for (auto& item : placed) {
             x += item.lead;
@@ -5816,7 +5856,7 @@ bool OnRenderingUnsafe(double now, double dt) {
         restRight = boxRight + metrics.padSide;
     }
     if (!placed.empty()) {
-        restRight += pinRoom;
+        restRight += extraRoom;
     }
     const double restTop = restBottom - metrics.icon - metrics.padTop;
 
@@ -6096,6 +6136,11 @@ bool OnRenderingUnsafe(double now, double dt) {
     }
     busy = busy || moving;
     // (The arrow after the last icon as it's drawn.)
+    double dlCenter = NAN;
+    if (dlRoom > 0 && !placed.empty()) {
+        dlCenter = drawnRight + metrics.gap + dlSize / 2;
+        drawnRight += dlRoom;
+    }
     double pinCenter = NAN;
     if (pinRoom > 0 && !placed.empty()) {
         pinCenter = drawnRight + metrics.gap + pinSize / 2;
@@ -6132,6 +6177,62 @@ bool OnRenderingUnsafe(double now, double dt) {
                 {shelf.X - origin.X, shelf.Y - origin.Y, shelf.Width,
                  shelf.Height},
                 std::min(g_settings.cornerRadius, (double)shelf.Height / 2));
+            if (auto dl = g_dockShelf.downloads) {
+                if (std::isnan(dlCenter)) {
+                    if (dl.Visibility() != Visibility::Collapsed) {
+                        dl.Visibility(Visibility::Collapsed);
+                    }
+                    g_dockShelf.downloadsRect = {};
+                } else {
+                    // Bouncing as a download finished.
+                    double lift = 0;
+                    const double since =
+                        NowSeconds() - g_downloadsBounceAt.load();
+                    if (since >= 0 && since < 5) {
+                        bool done = true;
+                        lift = BounceSequence(since, 1, &done) * dlSize *
+                               kDockBounce;
+                        if (!done) {
+                            busy = true;
+                        }
+                    }
+                    g_dockShelf.downloadsRect = {
+                        (float)(dlCenter - dlSize / 2 - metrics.gap / 2),
+                        (float)restTop, (float)(dlSize + metrics.gap),
+                        (float)(shelfBottom - restTop)};
+                    const int shows = g_downloadsActive ? 1 : 0;
+                    if (shows != g_dockShelf.downloadsShows) {
+                        g_dockShelf.downloadsShows = shows;
+                        const bool lightGlyph =
+                            g_settings.dockIslandStyle || !IsLightTheme();
+                        dl.Foreground(Media::SolidColorBrush(
+                            shows ? winrt::Windows::UI::Color{255, 0x4C, 0xC2,
+                                                              0xFF}
+                            : lightGlyph
+                                ? winrt::Windows::UI::Color{255, 255, 255, 255}
+                                : winrt::Windows::UI::Color{255, 0, 0, 0}));
+                    }
+                    const auto& r = g_dockShelf.downloadsRect;
+                    const bool hovered = mouseX >= r.X &&
+                                         mouseX <= r.X + r.Width &&
+                                         mouseY >= r.Y &&
+                                         mouseY <= r.Y + r.Height;
+                    if (hovered != g_dockShelf.downloadsHovered) {
+                        g_dockShelf.downloadsHovered = hovered;
+                        dl.Opacity(hovered ? 1.0 : 0.85);
+                    }
+                    if (dl.Visibility() != Visibility::Visible) {
+                        dl.Visibility(Visibility::Visible);
+                    }
+                    dl.Width(dlSize);
+                    dl.Height(dlSize);
+                    dl.FontSize(dlSize * 0.72);
+                    Controls::Canvas::SetLeft(
+                        dl, dlCenter - dlSize / 2 - origin.X);
+                    Controls::Canvas::SetTop(
+                        dl, restBottom - dlSize - lift - origin.Y);
+                }
+            }
             if (auto pin = g_dockShelf.pin) {
                 if (std::isnan(pinCenter)) {
                     if (pin.Visibility() != Visibility::Collapsed) {
@@ -7030,6 +7131,27 @@ void SetupDockBehavior(HWND hWnd,
                 }
             }
             DockScope scope(hWnd);
+            if (g_dockShelf.downloads && args.GetCurrentPoint(nullptr)
+                                             .Properties()
+                                             .IsLeftButtonPressed()) {
+                const auto point = args.GetCurrentPoint(nullptr).Position();
+                const auto& r = g_dockShelf.downloadsRect;
+                if (r.Width > 0 && point.X >= r.X && point.X <= r.X + r.Width &&
+                    point.Y >= r.Y && point.Y <= r.Y + r.Height) {
+                    args.Handled(true);
+                    RECT window{};
+                    GetWindowRect(hWnd, &window);
+                    const double k = GetDpiForWindow(hWnd) / 96.0;
+                    const double top =
+                        g_dockShelfNow.Height > 0
+                            ? std::min(g_dockShelfNow.Y, r.Y)
+                            : r.Y;
+                    ToggleDownloadsPanel(
+                        window.left + (int)std::lround((r.X + r.Width / 2) * k),
+                        window.top + (int)std::lround(top * k), hWnd);
+                    return;
+                }
+            }
             if (g_dockShelf.pin && args.GetCurrentPoint(nullptr)
                                        .Properties()
                                        .IsLeftButtonPressed()) {
@@ -8173,7 +8295,8 @@ bool DockMayHide(HWND hWnd) {
     if (g_unloading || !g_taskbarAutoHides || !IsDock() || hWnd != g_dockWnd ||
         g_dockRoomOpen ||
         g_dockHovered || IsRectEmpty(&g_dockShelfRest) || DockTrayShown() ||
-        IsKeptShown(hWnd) || JumpListOpen(hWnd) || !DockHidesOn(hWnd)) {
+        IsKeptShown(hWnd) || JumpListOpen(hWnd) || !DockHidesOn(hWnd) ||
+        g_downloadsPanelOpen) {
         return false;
     }
     RECT window{};
@@ -9133,6 +9256,684 @@ DWORD WINAPI DockPinAutoHideThreadProc(LPVOID) {
     return 0;
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// The Downloads stack (dock.downloads): an icon in the dock and a panel above
+// it with the latest files in Downloads, like macOS's. The folder is watched
+// on a thread of its own, which also runs the panel (a window of the mod's
+// own, black like the island). Files still downloading are the browsers'
+// unfinished ones: Chrome's and Edge's ".crdownload", Firefox's and Zen's
+// ".part" (next to an empty file with the final name).
+
+// (Defined further down.)
+std::wstring KnownFolderPath(const GUID& folder);
+
+constexpr UINT kDownloadsToggle = WM_APP + 10;
+constexpr int kDownloadsMax = 12;
+constexpr int kDownloadsColumns = 4;
+constexpr WCHAR kDownloadsClass[] = L"WindhawkMacDockDownloads";
+// Panel measures, in DIPs.
+constexpr int kDlPad = 14;
+constexpr int kDlHeader = 34;
+constexpr int kDlTileWidth = 104;
+constexpr int kDlTileHeight = 116;
+constexpr int kDlThumb = 64;
+
+struct DownloadItem {
+    std::wstring path;
+    std::wstring name;
+    ULONGLONG size = 0;
+    FILETIME time{};
+    bool partial = false;
+    HBITMAP thumb = nullptr;
+    bool thumbTried = false;
+};
+
+HANDLE g_downloadsThread;
+DWORD g_downloadsThreadId;
+// The taskbar whose icon opened the panel (it may hide once it closes).
+std::atomic<HWND> g_downloadsTaskbar{nullptr};
+
+// (The thread's only, from here.)
+[[clang::no_destroy]] std::vector<DownloadItem> g_downloadItems;
+[[clang::no_destroy]] std::wstring g_downloadsDir;
+int g_downloadsPartials = 0;
+HWND g_downloadsWnd;
+POINT g_downloadsAnchor{};
+UINT g_downloadsDpi = 96;
+// The item under the mouse, -2 for "Open folder", -1 for none.
+int g_downloadsHover = -1;
+double g_downloadsClosedAt = 0;
+HFONT g_dlTitleFont;
+HFONT g_dlFont;
+HFONT g_dlSmallFont;
+HFONT g_dlGlyphFont;
+
+bool EndsWithI(const std::wstring& text, PCWSTR suffix) {
+    const size_t length = wcslen(suffix);
+    return text.size() > length &&
+           _wcsicmp(text.c_str() + text.size() - length, suffix) == 0;
+}
+
+int DlPx(int dips) {
+    return MulDiv(dips, g_downloadsDpi, 96);
+}
+
+void PokeDockRendering() {
+    if (HWND taskbar = FindCurrentProcessTaskbarWnd()) {
+        PostMessage(taskbar, WM_TIMER, kDownloadsRenderTimerId, 0);
+    }
+}
+
+std::wstring FormatDownloadSize(ULONGLONG size) {
+    WCHAR text[64];
+    if (size >= 1024ull * 1024 * 1024) {
+        swprintf_s(text, L"%.1f GB", size / (1024.0 * 1024 * 1024));
+    } else if (size >= 1024ull * 1024) {
+        swprintf_s(text, L"%.1f MB", size / (1024.0 * 1024));
+    } else {
+        swprintf_s(text, L"%llu KB", (size + 1023) / 1024);
+    }
+    for (WCHAR* c = text; *c; c++) {
+        if (*c == L'.') {
+            *c = L',';
+        }
+    }
+    return text;
+}
+
+void FreeDownloadThumbs(std::vector<DownloadItem>& items) {
+    for (auto& item : items) {
+        if (item.thumb) {
+            DeleteObject(item.thumb);
+            item.thumb = nullptr;
+        }
+    }
+}
+
+void PlaceDownloadsPanel();
+
+void ScanDownloads() {
+    std::vector<DownloadItem> found;
+    if (!g_downloadsDir.empty()) {
+        WIN32_FIND_DATA data;
+        HANDLE find = FindFirstFileEx((g_downloadsDir + L"\\*").c_str(),
+                                      FindExInfoBasic, &data,
+                                      FindExSearchNameMatch, nullptr,
+                                      FIND_FIRST_EX_LARGE_FETCH);
+        if (find != INVALID_HANDLE_VALUE) {
+            do {
+                std::wstring name = data.cFileName;
+                if (name == L"." || name == L".." ||
+                    (data.dwFileAttributes &
+                     (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM))) {
+                    continue;
+                }
+                DownloadItem item;
+                item.path = g_downloadsDir + L"\\" + name;
+                item.size = ((ULONGLONG)data.nFileSizeHigh << 32) |
+                            data.nFileSizeLow;
+                item.time = data.ftLastWriteTime;
+                if (EndsWithI(name, L".crdownload")) {
+                    item.partial = true;
+                    name.resize(name.size() - 11);
+                    if (name.rfind(L"Unconfirmed ", 0) == 0) {
+                        name = L"Download";
+                    }
+                } else if (EndsWithI(name, L".part")) {
+                    item.partial = true;
+                    name.resize(name.size() - 5);
+                }
+                item.name = name;
+                found.push_back(std::move(item));
+            } while (FindNextFile(find, &data));
+            FindClose(find);
+        }
+    }
+    // Firefox and Zen keep an empty file with the final name next to the
+    // ".part" one: only that one shows.
+    std::vector<std::wstring> partialNames;
+    for (const auto& item : found) {
+        if (item.partial) {
+            partialNames.push_back(item.name);
+        }
+    }
+    std::erase_if(found, [&](const DownloadItem& item) {
+        if (item.partial || item.size != 0) {
+            return false;
+        }
+        for (const auto& name : partialNames) {
+            if (_wcsicmp(name.c_str(), item.name.c_str()) == 0) {
+                return true;
+            }
+        }
+        return false;
+    });
+    const int partials = (int)partialNames.size();
+    std::sort(found.begin(), found.end(),
+              [](const DownloadItem& a, const DownloadItem& b) {
+                  if (a.partial != b.partial) {
+                      return a.partial;
+                  }
+                  return CompareFileTime(&a.time, &b.time) > 0;
+              });
+    if (found.size() > kDownloadsMax) {
+        found.resize(kDownloadsMax);
+    }
+    // The pictures of the files that didn't change are kept.
+    for (auto& item : found) {
+        if (item.partial) {
+            continue;
+        }
+        for (auto& old : g_downloadItems) {
+            if (!old.partial && old.path == item.path &&
+                CompareFileTime(&old.time, &item.time) == 0) {
+                item.thumb = old.thumb;
+                item.thumbTried = old.thumbTried;
+                old.thumb = nullptr;
+                break;
+            }
+        }
+    }
+    FreeDownloadThumbs(g_downloadItems);
+    g_downloadItems = std::move(found);
+
+    // One finished (fewer downloading than before): the icon bounces.
+    bool poke = false;
+    if (partials < g_downloadsPartials) {
+        g_downloadsBounceAt = NowSeconds();
+        poke = true;
+    }
+    g_downloadsPartials = partials;
+    if (g_downloadsActive != (partials > 0)) {
+        g_downloadsActive = partials > 0;
+        poke = true;
+    }
+    if (poke) {
+        PokeDockRendering();
+    }
+    if (g_downloadsWnd && IsWindowVisible(g_downloadsWnd)) {
+        PlaceDownloadsPanel();
+        InvalidateRect(g_downloadsWnd, nullptr, FALSE);
+    }
+}
+
+void MakeDownloadsFonts() {
+    for (HFONT* font : {&g_dlTitleFont, &g_dlFont, &g_dlSmallFont,
+                        &g_dlGlyphFont}) {
+        if (*font) {
+            DeleteObject(*font);
+            *font = nullptr;
+        }
+    }
+    auto make = [](int dips, int weight, PCWSTR face) {
+        return CreateFont(-DlPx(dips), 0, 0, 0, weight, FALSE, FALSE, FALSE,
+                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                          CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
+                          DEFAULT_PITCH, face);
+    };
+    g_dlTitleFont = make(15, FW_SEMIBOLD, L"Segoe UI");
+    g_dlFont = make(12, FW_NORMAL, L"Segoe UI");
+    g_dlSmallFont = make(11, FW_NORMAL, L"Segoe UI");
+    g_dlGlyphFont = make(40, FW_NORMAL, L"Segoe Fluent Icons");
+}
+
+int DownloadsRows() {
+    const int count = (int)g_downloadItems.size();
+    return std::max(1, (count + kDownloadsColumns - 1) / kDownloadsColumns);
+}
+
+RECT DownloadTileRect(int index) {
+    const int column = index % kDownloadsColumns;
+    const int row = index / kDownloadsColumns;
+    const int left = DlPx(kDlPad + column * kDlTileWidth);
+    const int top = DlPx(kDlPad + kDlHeader + row * kDlTileHeight);
+    return {left, top, left + DlPx(kDlTileWidth), top + DlPx(kDlTileHeight)};
+}
+
+RECT DownloadsFolderLinkRect() {
+    RECT client{};
+    GetClientRect(g_downloadsWnd, &client);
+    return {client.right - DlPx(kDlPad + 110), DlPx(kDlPad - 4),
+            client.right - DlPx(kDlPad), DlPx(kDlPad + kDlHeader - 10)};
+}
+
+void PlaceDownloadsPanel() {
+    const HMONITOR monitor =
+        MonitorFromPoint(g_downloadsAnchor, MONITOR_DEFAULTTONEAREST);
+    UINT dpiX = 96;
+    UINT dpiY = 96;
+    if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY))) {
+        dpiX = 96;
+    }
+    if (dpiX != g_downloadsDpi || !g_dlFont) {
+        g_downloadsDpi = dpiX;
+        MakeDownloadsFonts();
+        for (auto& item : g_downloadItems) {
+            if (item.thumb) {
+                DeleteObject(item.thumb);
+                item.thumb = nullptr;
+            }
+            item.thumbTried = false;
+        }
+    }
+    MONITORINFO info{sizeof(info)};
+    GetMonitorInfo(monitor, &info);
+    const int width = DlPx(kDlPad * 2 + kDownloadsColumns * kDlTileWidth);
+    const int height =
+        DlPx(kDlPad * 2 + kDlHeader + DownloadsRows() * kDlTileHeight);
+    const int margin = DlPx(10);
+    int left = g_downloadsAnchor.x - width / 2;
+    left = std::min(left, (int)info.rcMonitor.right - margin - width);
+    left = std::max(left, (int)info.rcMonitor.left + margin);
+    int top = g_downloadsAnchor.y - margin - height;
+    top = std::max(top, (int)info.rcMonitor.top + margin);
+    SetWindowPos(g_downloadsWnd, HWND_TOPMOST, left, top, width, height,
+                 SWP_NOACTIVATE);
+}
+
+HBITMAP LoadDownloadThumb(const std::wstring& path, int size) {
+    winrt::com_ptr<IShellItemImageFactory> factory;
+    if (FAILED(SHCreateItemFromParsingName(path.c_str(), nullptr,
+                                           IID_PPV_ARGS(factory.put())))) {
+        return nullptr;
+    }
+    HBITMAP bitmap = nullptr;
+    if (FAILED(factory->GetImage({size, size}, SIIGBF_RESIZETOFIT,
+                                 &bitmap))) {
+        return nullptr;
+    }
+    return bitmap;
+}
+
+void DrawDownloadThumb(HDC hdc, HBITMAP bitmap, const RECT& box) {
+    BITMAP info{};
+    if (!GetObject(bitmap, sizeof(info), &info) || !info.bmWidth ||
+        !info.bmHeight) {
+        return;
+    }
+    const int width = info.bmWidth;
+    const int height = std::abs(info.bmHeight);
+    const int x = box.left + (box.right - box.left - width) / 2;
+    const int y = box.top + (box.bottom - box.top - height) / 2;
+    HDC source = CreateCompatibleDC(hdc);
+    HGDIOBJ previous = SelectObject(source, bitmap);
+    if (info.bmBitsPixel == 32) {
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        AlphaBlend(hdc, x, y, width, height, source, 0, 0, width, height,
+                   blend);
+    } else {
+        BitBlt(hdc, x, y, width, height, source, 0, 0, SRCCOPY);
+    }
+    SelectObject(source, previous);
+    DeleteDC(source);
+}
+
+void FillRounded(HDC hdc, const RECT& rect, int radius, COLORREF color) {
+    HBRUSH brush = CreateSolidBrush(color);
+    HPEN pen = CreatePen(PS_SOLID, 1, color);
+    HGDIOBJ oldBrush = SelectObject(hdc, brush);
+    HGDIOBJ oldPen = SelectObject(hdc, pen);
+    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius,
+              radius);
+    SelectObject(hdc, oldBrush);
+    SelectObject(hdc, oldPen);
+    DeleteObject(brush);
+    DeleteObject(pen);
+}
+
+void PaintDownloads(HWND hWnd, HDC target) {
+    RECT client{};
+    GetClientRect(hWnd, &client);
+    HDC hdc = CreateCompatibleDC(target);
+    HBITMAP canvas = CreateCompatibleBitmap(target, client.right, client.bottom);
+    HGDIOBJ oldCanvas = SelectObject(hdc, canvas);
+    HBRUSH background = CreateSolidBrush(RGB(6, 6, 6));
+    FillRect(hdc, &client, background);
+    DeleteObject(background);
+    SetBkMode(hdc, TRANSPARENT);
+
+    constexpr COLORREF kWhite = RGB(240, 240, 240);
+    constexpr COLORREF kGray = RGB(150, 150, 150);
+    constexpr COLORREF kBlue = RGB(0x4C, 0xC2, 0xFF);
+
+    HGDIOBJ oldFont = SelectObject(hdc, g_dlTitleFont);
+    SetTextColor(hdc, kWhite);
+    RECT title{DlPx(kDlPad + 6), DlPx(kDlPad - 4), client.right / 2,
+               DlPx(kDlPad + kDlHeader - 10)};
+    DrawText(hdc, L"Downloads", -1, &title,
+             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    SelectObject(hdc, g_dlFont);
+    RECT link = DownloadsFolderLinkRect();
+    if (g_downloadsHover == -2) {
+        FillRounded(hdc, link, DlPx(10), RGB(38, 38, 38));
+    }
+    SetTextColor(hdc, g_downloadsHover == -2 ? kWhite : kBlue);
+    DrawText(hdc, L"Abrir pasta", -1, &link,
+             DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    if (g_downloadItems.empty()) {
+        RECT empty{0, DlPx(kDlPad + kDlHeader), client.right,
+                   client.bottom - DlPx(kDlPad)};
+        SetTextColor(hdc, kGray);
+        DrawText(hdc, L"Nenhum arquivo em Downloads", -1, &empty,
+                 DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+
+    for (int i = 0; i < (int)g_downloadItems.size(); i++) {
+        DownloadItem& item = g_downloadItems[i];
+        const RECT tile = DownloadTileRect(i);
+        if (g_downloadsHover == i) {
+            RECT hover = tile;
+            InflateRect(&hover, -DlPx(3), -DlPx(3));
+            FillRounded(hdc, hover, DlPx(12), RGB(38, 38, 38));
+        }
+        const RECT box{tile.left + (tile.right - tile.left - DlPx(kDlThumb)) / 2,
+                       tile.top + DlPx(8),
+                       tile.left + (tile.right - tile.left + DlPx(kDlThumb)) / 2,
+                       tile.top + DlPx(8 + kDlThumb)};
+        if (item.partial) {
+            SelectObject(hdc, g_dlGlyphFont);
+            SetTextColor(hdc, kBlue);
+            RECT glyph = box;
+            DrawText(hdc, L"", -1, &glyph,
+                     DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        } else {
+            if (!item.thumbTried) {
+                item.thumbTried = true;
+                item.thumb = LoadDownloadThumb(item.path, DlPx(kDlThumb));
+            }
+            if (item.thumb) {
+                DrawDownloadThumb(hdc, item.thumb, box);
+            }
+        }
+        SelectObject(hdc, g_dlFont);
+        SetTextColor(hdc, kWhite);
+        RECT name{tile.left + DlPx(6), box.bottom + DlPx(4),
+                  tile.right - DlPx(6), box.bottom + DlPx(4 + 30)};
+        DrawText(hdc, item.name.c_str(), -1, &name,
+                 DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_EDITCONTROL |
+                     DT_NOPREFIX);
+        SelectObject(hdc, g_dlSmallFont);
+        RECT detail{tile.left + DlPx(4), name.bottom, tile.right - DlPx(4),
+                    tile.bottom - DlPx(2)};
+        std::wstring text = FormatDownloadSize(item.size);
+        if (item.partial) {
+            text = L"Baixando… " + text;
+            SetTextColor(hdc, kBlue);
+        } else {
+            SetTextColor(hdc, kGray);
+        }
+        DrawText(hdc, text.c_str(), -1, &detail,
+                 DT_CENTER | DT_TOP | DT_SINGLELINE | DT_END_ELLIPSIS);
+    }
+
+    SelectObject(hdc, oldFont);
+    BitBlt(target, 0, 0, client.right, client.bottom, hdc, 0, 0, SRCCOPY);
+    SelectObject(hdc, oldCanvas);
+    DeleteObject(canvas);
+    DeleteDC(hdc);
+}
+
+int DownloadsHitTest(POINT pt) {
+    const RECT link = DownloadsFolderLinkRect();
+    if (PtInRect(&link, pt)) {
+        return -2;
+    }
+    for (int i = 0; i < (int)g_downloadItems.size(); i++) {
+        const RECT tile = DownloadTileRect(i);
+        if (PtInRect(&tile, pt)) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+void HideDownloadsPanel() {
+    if (!g_downloadsWnd || !IsWindowVisible(g_downloadsWnd)) {
+        return;
+    }
+    ShowWindow(g_downloadsWnd, SW_HIDE);
+    g_downloadsPanelOpen = false;
+    g_downloadsClosedAt = NowSeconds();
+    g_downloadsHover = -1;
+    // Its taskbar may hide now (it asks whether it may).
+    if (HWND taskbar = g_downloadsTaskbar.load(); taskbar && IsWindow(taskbar)) {
+        PostMessage(taskbar, WM_TIMER, kHideTimerId, 0);
+    }
+}
+
+void OpenInFolder(const std::wstring& path) {
+    const std::wstring args = L"/select,\"" + path + L"\"";
+    ShellExecute(nullptr, nullptr, L"explorer.exe", args.c_str(), nullptr,
+                 SW_SHOWNORMAL);
+}
+
+LRESULT CALLBACK DownloadsWndProc(HWND hWnd,
+                                  UINT msg,
+                                  WPARAM wParam,
+                                  LPARAM lParam) {
+    switch (msg) {
+        case WM_PAINT: {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hWnd, &ps);
+            PaintDownloads(hWnd, hdc);
+            EndPaint(hWnd, &ps);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_MOUSEMOVE: {
+            const int hover =
+                DownloadsHitTest({(short)LOWORD(lParam), (short)HIWORD(lParam)});
+            if (hover != g_downloadsHover) {
+                g_downloadsHover = hover;
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            TRACKMOUSEEVENT track{sizeof(track), TME_LEAVE, hWnd, 0};
+            TrackMouseEvent(&track);
+            return 0;
+        }
+        case WM_MOUSELEAVE:
+            if (g_downloadsHover != -1) {
+                g_downloadsHover = -1;
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            return 0;
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP: {
+            const int hit =
+                DownloadsHitTest({(short)LOWORD(lParam), (short)HIWORD(lParam)});
+            if (hit == -2) {
+                HideDownloadsPanel();
+                ShellExecute(nullptr, L"open", g_downloadsDir.c_str(), nullptr,
+                             nullptr, SW_SHOWNORMAL);
+            } else if (hit >= 0 && hit < (int)g_downloadItems.size()) {
+                const DownloadItem item = g_downloadItems[hit];
+                HideDownloadsPanel();
+                // (Still downloading, or a right click: shown in its folder.)
+                if (item.partial || msg == WM_RBUTTONUP) {
+                    OpenInFolder(item.path);
+                } else {
+                    ShellExecute(nullptr, L"open", item.path.c_str(), nullptr,
+                                 g_downloadsDir.c_str(), SW_SHOWNORMAL);
+                }
+            }
+            return 0;
+        }
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) {
+                HideDownloadsPanel();
+            }
+            return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) == WA_INACTIVE) {
+                HideDownloadsPanel();
+            }
+            return 0;
+        case WM_MOUSEACTIVATE:
+            return MA_ACTIVATE;
+    }
+    return DefWindowProc(hWnd, msg, wParam, lParam);
+}
+
+void ShowDownloadsPanel(int x, int y) {
+    if (!g_downloadsWnd) {
+        g_downloadsWnd = CreateWindowEx(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_LAYERED, kDownloadsClass,
+            L"Downloads", WS_POPUP, 0, 0, 10, 10, nullptr, nullptr,
+            GetModuleHandle(nullptr), nullptr);
+        if (!g_downloadsWnd) {
+            return;
+        }
+        // Black like the island, a little see-through, with round corners
+        // and no border.
+        SetLayeredWindowAttributes(g_downloadsWnd, 0, 242, LWA_ALPHA);
+        const DWORD corners = 2;  // DWMWCP_ROUND
+        DwmSetWindowAttribute(g_downloadsWnd, 33, &corners, sizeof(corners));
+        const COLORREF noBorder = 0xFFFFFFFE;  // DWMWA_COLOR_NONE
+        DwmSetWindowAttribute(g_downloadsWnd, 34, &noBorder, sizeof(noBorder));
+    }
+    g_downloadsAnchor = {x, y};
+    ScanDownloads();
+    PlaceDownloadsPanel();
+    g_downloadsHover = -1;
+    g_downloadsPanelOpen = true;
+    ShowWindow(g_downloadsWnd, SW_SHOW);
+    SetForegroundWindow(g_downloadsWnd);
+    InvalidateRect(g_downloadsWnd, nullptr, FALSE);
+}
+
+DWORD WINAPI DownloadsThreadProc(LPVOID started) {
+    const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    MSG msg;
+    PeekMessage(&msg, nullptr, WM_USER, WM_USER, PM_NOREMOVE);
+    SetEvent((HANDLE)started);
+
+    WNDCLASS wc{};
+    wc.lpfnWndProc = DownloadsWndProc;
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    wc.lpszClassName = kDownloadsClass;
+    RegisterClass(&wc);
+
+    g_downloadsDir = KnownFolderPath(FOLDERID_Downloads);
+    HANDLE change = INVALID_HANDLE_VALUE;
+    if (!g_downloadsDir.empty()) {
+        change = FindFirstChangeNotification(
+            g_downloadsDir.c_str(), FALSE,
+            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_SIZE |
+                FILE_NOTIFY_CHANGE_LAST_WRITE);
+    }
+    const bool watching = change != INVALID_HANDLE_VALUE;
+    ScanDownloads();
+
+    double rescanAt = 0;
+    bool quit = false;
+    while (!quit) {
+        DWORD timeout = INFINITE;
+        if (rescanAt > 0) {
+            timeout = (DWORD)std::max(0.0, (rescanAt - NowSeconds()) * 1000);
+        } else if (g_downloadsActive) {
+            // (Growing files: their sizes as they grow.)
+            timeout = 1000;
+        }
+        const DWORD result = MsgWaitForMultipleObjects(
+            watching ? 1 : 0, &change, FALSE, timeout, QS_ALLINPUT);
+        if (watching && result == WAIT_OBJECT_0) {
+            FindNextChangeNotification(change);
+            if (rescanAt == 0) {
+                rescanAt = NowSeconds() + 0.3;
+            }
+            continue;
+        }
+        if (result == WAIT_TIMEOUT) {
+            rescanAt = 0;
+            ScanDownloads();
+            continue;
+        }
+        while (PeekMessage(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            if (msg.message == WM_QUIT) {
+                quit = true;
+                break;
+            }
+            if (!msg.hwnd && msg.message == kDownloadsToggle) {
+                if (g_downloadsWnd && IsWindowVisible(g_downloadsWnd)) {
+                    HideDownloadsPanel();
+                } else if (NowSeconds() - g_downloadsClosedAt > 0.3) {
+                    // (Not the click on its icon that just closed it.)
+                    ShowDownloadsPanel((int)msg.wParam, (int)msg.lParam);
+                }
+                continue;
+            }
+            TranslateMessage(&msg);
+            DispatchMessage(&msg);
+        }
+    }
+
+    if (g_downloadsWnd) {
+        DestroyWindow(g_downloadsWnd);
+        g_downloadsWnd = nullptr;
+    }
+    g_downloadsPanelOpen = false;
+    g_downloadsActive = false;
+    if (watching) {
+        FindCloseChangeNotification(change);
+    }
+    FreeDownloadThumbs(g_downloadItems);
+    g_downloadItems.clear();
+    g_downloadsPartials = 0;
+    for (HFONT* font : {&g_dlTitleFont, &g_dlFont, &g_dlSmallFont,
+                        &g_dlGlyphFont}) {
+        if (*font) {
+            DeleteObject(*font);
+            *font = nullptr;
+        }
+    }
+    UnregisterClass(kDownloadsClass, GetModuleHandle(nullptr));
+    if (SUCCEEDED(com)) {
+        CoUninitialize();
+    }
+    return 0;
+}
+
+void StartDownloads() {
+    if (g_downloadsThread) {
+        return;
+    }
+    HANDLE started = CreateEvent(nullptr, TRUE, FALSE, nullptr);
+    if (!started) {
+        return;
+    }
+    g_downloadsThread = CreateThread(nullptr, 0, DownloadsThreadProc, started,
+                                     0, &g_downloadsThreadId);
+    if (g_downloadsThread) {
+        WaitForSingleObject(started, INFINITE);
+    } else {
+        g_downloadsThreadId = 0;
+    }
+    CloseHandle(started);
+}
+
+void StopDownloads() {
+    if (!g_downloadsThread) {
+        return;
+    }
+    PostThreadMessage(g_downloadsThreadId, WM_QUIT, 0, 0);
+    WaitForSingleObject(g_downloadsThread, 5000);
+    CloseHandle(g_downloadsThread);
+    g_downloadsThread = nullptr;
+    g_downloadsThreadId = 0;
+}
+
+void ToggleDownloadsPanel(int x, int y, HWND taskbar) {
+    g_downloadsTaskbar = taskbar;
+    if (g_downloadsThreadId) {
+        PostThreadMessage(g_downloadsThreadId, kDownloadsToggle, (WPARAM)x,
+                          (LPARAM)y);
+    }
+}
+
 // The dock's arrow clicked (on its taskbar's thread): the dock on that
 // monitor is kept shown, or hides itself from now on, and Windows' auto-hide
 // follows (on a thread of its own: it asks the taskbar's thread).
@@ -9897,6 +10698,12 @@ LRESULT CALLBACK TaskbarSubclassProc(HWND hWnd,
     }
     // Shown at once by Windows and still up a moment later: the dock shows
     // now (see kQuietShowDelayMs).
+    if (uMsg == WM_TIMER && wParam == kDownloadsRenderTimerId) {
+        if (!g_unloading) {
+            StartRendering();
+        }
+        return 0;
+    }
     if (uMsg == WM_TIMER && wParam == kPinnedShowTimerId) {
         if (!g_unloading && IsDock() && g_settings.dockPinButton &&
             !DockHidesOn(hWnd)) {
@@ -10452,6 +11259,11 @@ BOOL WINAPI CTaskListWnd_PermitAutoHide_Hook(void* pThis) {
     const HWND dock = g_dockWnd;
     // Kept shown on its monitor with its arrow (see ToggleDockPin).
     if (!g_unloading && IsDock() && !DockHidesOn(dock)) {
+        return FALSE;
+    }
+    // The Downloads panel is open above it: tried again a moment later.
+    if (!g_unloading && IsDock() && g_downloadsPanelOpen) {
+        ScheduleTaskbarHide(dock, 300);
         return FALSE;
     }
     // An app clicked in the dock is opening (see KeepDockShown), the mouse
@@ -13068,6 +13880,7 @@ void LoadSettings() {
     g_settings.bottomGap = std::clamp(Wh_GetIntSetting(L"dock.bottomGap"), 0, 24);
     g_settings.dockIslandStyle = Wh_GetIntSetting(L"dock.islandStyle") != 0;
     g_settings.dockPinButton = Wh_GetIntSetting(L"dock.pinButton") != 0;
+    g_settings.dockDownloads = Wh_GetIntSetting(L"dock.downloads") != 0;
     if (g_settings.dockIslandStyle) {
         g_settings.bottomGap = 0;
     }
@@ -13152,6 +13965,9 @@ void ExplorerModAfterInit() {
     StartLateStart();
     StartJumpListMove();
     StartPinnedBars();
+    if (g_settings.dockDownloads && IsDock()) {
+        StartDownloads();
+    }
 }
 
 void ExplorerModBeforeUninit() {
@@ -13160,6 +13976,7 @@ void ExplorerModBeforeUninit() {
     g_unloading = true;
     StopJumpListMove();
     StopPinnedBars();
+    StopDownloads();
     StopWatchingTaskbarPlace();
     StopLateStart();
     StopEdgeWatch();
@@ -13261,6 +14078,11 @@ void ExplorerModSettingsChanged() {
     StartEdgeWatch();
     StartLateStart();
     SyncPinnedBarsSoon();
+    if (g_settings.dockDownloads && IsDock()) {
+        StartDownloads();
+    } else {
+        StopDownloads();
+    }
     ReleaseSRWLockExclusive(&g_explorerSettingsLock);
 }
 
