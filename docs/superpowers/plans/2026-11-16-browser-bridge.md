@@ -4,7 +4,7 @@
 
 **Goal:** Pausar/continuar/cancelar e ver a % dos downloads do Chrome e do Zen pelo painel de Downloads da dock.
 
-**Architecture:** Uma extensão MV3 (`extension/`) conecta via WebSocket em `127.0.0.1:47821`, servido por uma thread nova dentro do mod (`mac-dock-26320.wh.cpp`). A extensão manda a lista de downloads; a dock manda comandos. O painel GDI existente mostra os itens do navegador com barra e botões.
+**Architecture:** Uma extensão MV3 (`extension/`) conecta via WebSocket em `127.0.0.1:27821`, servido por uma thread nova dentro do mod (`mac-dock-26320.wh.cpp`). A extensão manda a lista de downloads; a dock manda comandos. O painel GDI existente mostra os itens do navegador com barra e botões.
 
 **Tech Stack:** C++23 (clang/mingw do Windhawk), Winsock, BCrypt, `winrt::Windows::Data::Json`; JavaScript (MV3, `chrome.downloads` / `browser.downloads`); Node 26 para testes da extensão.
 
@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Porta `47821`, bind só em `127.0.0.1`; até 4 clientes.
+- Porta `27821`, bind só em `127.0.0.1`; até 4 clientes.
 - Handshake só com `Origin` começando com `chrome-extension://` ou `moz-extension://`; outros → HTTP 403 e fecha.
 - Sem polling rápido: thread da dock bloqueia em `WaitForMultipleObjects` sem timeout curto; extensão manda `downloads` a cada 1 s só com download ativo e `ping` a cada 20 s.
 - Mod compila em 64 **e** 32 bits (`dock-link.ps1`, `dock-link32.ps1` → `exit=0`); callbacks Win32 são funções nomeadas, nunca lambdas.
@@ -59,7 +59,7 @@ test("nextDelay", () => { assert.equal(nextDelay(5000), 10000); assert.equal(nex
 ```
 
 - [ ] **Step 2:** `node --test extension/` → FAIL (módulo não existe).
-- [ ] **Step 3:** Implementar `protocol.js`; `background.js` usa `chrome.downloads` (no Zen `chrome` também existe): conecta `ws://127.0.0.1:47821`, manda `hello` (`browser`: `"zen"` se `navigator.userAgent` contém `Firefox`, senão `"chrome"`), escuta `onCreated`/`onChanged`/`onErased`, manda `downloads` com todos os ativos; `setInterval` 1 s só enquanto houver ativo; `ping` 20 s; comandos → `chrome.downloads.pause/resume/cancel`; reconexão com `nextDelay` (e `chrome.alarms` de 1 min para acordar o service worker). `manifest.json`: MV3, `permissions: ["downloads","alarms"]`, `background: {service_worker: "background.js", scripts: ["background.js"], type: "module"}`, gecko id e `strict_min_version: "121.0"`.
+- [ ] **Step 3:** Implementar `protocol.js`; `background.js` usa `chrome.downloads` (no Zen `chrome` também existe): conecta `ws://127.0.0.1:27821`, manda `hello` (`browser`: `"zen"` se `navigator.userAgent` contém `Firefox`, senão `"chrome"`), escuta `onCreated`/`onChanged`/`onErased`, manda `downloads` com todos os ativos; `setInterval` 1 s só enquanto houver ativo; `ping` 20 s; comandos → `chrome.downloads.pause/resume/cancel`; reconexão com `nextDelay` (e `chrome.alarms` de 1 min para acordar o service worker). `manifest.json`: MV3, `permissions: ["downloads","alarms"]`, `background: {service_worker: "background.js", scripts: ["background.js"], type: "module"}`, gecko id e `strict_min_version: "121.0"`.
 - [ ] **Step 4:** `node --test extension/` → PASS; `node --check extension/background.js` → sem erro.
 - [ ] **Step 5:** Commit `feat(extension): downloads bridge extension`.
 

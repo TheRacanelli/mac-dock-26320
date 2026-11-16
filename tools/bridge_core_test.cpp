@@ -54,7 +54,7 @@ static void TestAcceptKey() {
 
 static void TestHeaderValue() {
     const std::string request =
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1:47821\r\nsec-websocket-key:  abc== "
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:27821\r\nsec-websocket-key:  abc== "
         "\r\nOrigin: chrome-extension://xyz\r\n\r\n";
     CHECK(HttpHeaderValue(request, "Sec-WebSocket-Key") == "abc==");
     CHECK(HttpHeaderValue(request, "origin") == "chrome-extension://xyz");

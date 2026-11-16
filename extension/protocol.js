@@ -1,6 +1,6 @@
 // Mac Dock Downloads: what the extension and the dock say to each other.
 
-export const PORT = 47821;
+export const PORT = 27821;
 const COMMANDS = ["pause", "resume", "cancel"];
 
 // A browser download as the dock wants it.

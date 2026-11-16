@@ -35,7 +35,7 @@ barra veio de mods do **m417z**.
 
 Com a extensão **Mac Dock Downloads** ([`extension/`](extension/)), o painel de Downloads mostra
 os downloads do Chrome e do Zen com a porcentagem e botões ⏸/▶ e ✕. A dock só escuta em
-`127.0.0.1:47821` e só aceita extensões de navegador (opção **Ponte com navegadores**).
+`127.0.0.1:27821` e só aceita extensões de navegador (opção **Ponte com navegadores**).
 
 **Chrome** (uma vez): no painel de Downloads, clique em **Instalar no Chrome**. A dock grava a
 extensão em `%LOCALAPPDATA%\MacDock\extensao`, copia o caminho e abre `chrome://extensions`.

@@ -1,4 +1,4 @@
-// Mac Dock Downloads: tells the dock (Windhawk mod, ws://127.0.0.1:47821)
+// Mac Dock Downloads: tells the dock (Windhawk mod, ws://127.0.0.1:27821)
 // what's downloading and does what it asks: pause, resume, cancel.
 import { PORT, toItem, isActive, parseCommand, nextDelay } from "./protocol.js";
 

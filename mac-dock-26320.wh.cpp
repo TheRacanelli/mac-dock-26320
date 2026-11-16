@@ -4,7 +4,7 @@
 // @name:pt-BR      Dock estilo Mac (build 26320)
 // @description     A macOS-like dock instead of the taskbar (only the dock from Mac Island & Dock, fixed for build 26320)
 // @description:pt-BR Uma dock como a do macOS no lugar da barra de tarefas (só a dock do Mac Island & Dock, corrigida para o build 26320)
-// @version         3.1.0-dock11
+// @version         3.1.0-dock12
 // @author          caliberda
 // @github          https://github.com/cesarkali
 // @homepage        https://island.caliberda.com.br
@@ -479,8 +479,8 @@ O código que alcança o XAML da barra é baseado no mod
   - browserBridge: true
     $name: Browser bridge (pause/cancel downloads)
     $name:pt-BR: Ponte com navegadores (pausar/cancelar downloads)
-    $description: With the "Mac Dock Downloads" extension in Chrome or Zen, the Downloads panel shows their downloads with their progress and can pause, resume and cancel them. The dock listens only on this computer (127.0.0.1:47821) and only to browser extensions
-    $description:pt-BR: Com a extensão "Mac Dock Downloads" no Chrome ou no Zen, o painel de Downloads mostra os downloads deles com a porcentagem e consegue pausar, continuar e cancelar. A dock só escuta neste computador (127.0.0.1:47821) e só extensões de navegador
+    $description: With the "Mac Dock Downloads" extension in Chrome or Zen, the Downloads panel shows their downloads with their progress and can pause, resume and cancel them. The dock listens only on this computer (127.0.0.1:27821) and only to browser extensions
+    $description:pt-BR: Com a extensão "Mac Dock Downloads" no Chrome ou no Zen, o painel de Downloads mostra os downloads deles com a porcentagem e consegue pausar, continuar e cancelar. A dock só escuta neste computador (127.0.0.1:27821) e só extensões de navegador
   - backgroundOpacity: 50
     $name: Background color (%)
     $name:pt-BR: Cor do fundo (%)
@@ -10420,7 +10420,7 @@ constexpr char kExtensionManifest[] = R"MDX({
 // EXTENSION-FILE protocol.js
 constexpr char kExtensionProtocol[] = R"MDX(// Mac Dock Downloads: what the extension and the dock say to each other.
 
-export const PORT = 47821;
+export const PORT = 27821;
 const COMMANDS = ["pause", "resume", "cancel"];
 
 // A browser download as the dock wants it.
@@ -10464,7 +10464,7 @@ export function nextDelay(previousMs) {
 }
 )MDX";
 // EXTENSION-FILE background.js
-constexpr char kExtensionBackground[] = R"MDX(// Mac Dock Downloads: tells the dock (Windhawk mod, ws://127.0.0.1:47821)
+constexpr char kExtensionBackground[] = R"MDX(// Mac Dock Downloads: tells the dock (Windhawk mod, ws://127.0.0.1:27821)
 // what's downloading and does what it asks: pause, resume, cancel.
 import { PORT, toItem, isActive, parseCommand, nextDelay } from "./protocol.js";
 
@@ -10824,7 +10824,7 @@ void ShowDownloadsPanel(int x, int y) {
 }
 
 // The browser bridge (dock.browserBridge): the "Mac Dock Downloads"
-// extension in Chrome or Zen connects here, on 127.0.0.1:47821, over a
+// extension in Chrome or Zen connects here, on 127.0.0.1:27821, over a
 // WebSocket. It sends what's downloading; the dock sends pause, resume and
 // cancel. Only browser extensions' origins are let in. A thread of its own
 // waits on its sockets (no polling).
@@ -11031,7 +11031,10 @@ std::string WsEncode(int opcode, const std::string& payload) {
 }
 // BRIDGE-CORE-END
 
-constexpr USHORT kBridgePort = 47821;
+// (Below 32768: WSL's mirrored networking quietly reserves Linux's
+// ephemeral ports, 32768 to 60999, on Windows too, and they don't show in
+// netstat; Windows' own dynamic ports start at 49152.)
+constexpr USHORT kBridgePort = 27821;
 constexpr int kBridgeMaxClients = 4;
 
 struct BridgeClient {

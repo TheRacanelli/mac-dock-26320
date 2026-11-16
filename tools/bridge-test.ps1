@@ -2,7 +2,7 @@
 # on): an extension's origin gets in and can talk; a web page's is refused.
 # Run with PowerShell 7: pwsh -File tools/bridge-test.ps1
 $ErrorActionPreference = 'Stop'
-$uri = [Uri]'ws://127.0.0.1:47821'
+$uri = [Uri]'ws://127.0.0.1:27821'
 $failed = $false
 
 function Connect([string]$origin) {

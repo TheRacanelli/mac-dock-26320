@@ -35,14 +35,14 @@ controle). Uso pessoal do autor por enquanto (não publicado em lojas).
 ## Abordagens consideradas
 
 1. **Servidor WebSocket local dentro da dock (escolhida).** A dock escuta em
-   `127.0.0.1:47821`; a extensão conecta. Sem exe extra; a dock grava a
+   `127.0.0.1:27821`; a extensão conecta. Sem exe extra; a dock grava a
    extensão sozinha. Custo: ~300 linhas (handshake SHA-1/base64, quadros).
 2. **Native messaging + exe ajudante.** Oficial, mas exige um `.exe` separado,
    registro no Windows e ainda um canal exe ↔ explorer.exe. Mais peças.
 
 ## Decisões (como foi decidido)
 
-- Porta fixa `47821`, só loopback. Aceita até 4 clientes; cada um se apresenta
+- Porta fixa `27821`, só loopback. Aceita até 4 clientes; cada um se apresenta
   com `hello` (`browser: "chrome" | "zen"`).
 - Só aceita handshake com `Origin` começando com `chrome-extension://` ou
   `moz-extension://`.
